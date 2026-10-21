@@ -1,0 +1,395 @@
+"""tide.plugins — the one list that says what is core and what is removable.
+
+Why this module exists
+----------------------
+Until now the boundary between "the stack itself" and "things bolted onto it"
+existed nowhere but in the skills dir. The board's tabs (threads, issues, work,
+projects, news, pages, skills) were nailed straight into the markup: turning the
+news feed or the drawing canvas off meant deleting code. This module is the
+single place that names the parts, so handing tide to another person can start
+from "here is the core, here is what you may switch on".
+
+Two halves, deliberately separated
+----------------------------------
+1. **The catalogue** — :data:`CORE` and :data:`PLUGINS` right below. This ships
+   with the engine, because *what a part is* is a property of the code, not of
+   the person running it. One table, readable top to bottom.
+2. **The switchboard** — a plain text file in the person's control-home
+   (``<control-home>/.tide/plugins``). This is per-person state: which of the
+   removable parts this particular install wants. It sits at the ``.tide/`` root
+   next to ``deferred.md`` for the same reason that one does — it is meant to be
+   opened and edited by a human, not managed by a tool.
+
+The safe default is ON
+----------------------
+A missing file, an unreadable file, a garbage line, an unknown name — none of
+these may take a working surface away from someone. :func:`enabled` folds all of
+them into "everything is on". The only thing that switches a plugin off is an
+explicit ``name = off`` line. That is what guarantees an existing install (which
+has no such file) keeps the board it had yesterday, to the pixel.
+
+Reading it
+----------
+    from tide import plugins
+    plugins.enabled()            # {'news', 'pages', 'skills', 'issues', 'work'}
+    plugins.is_enabled('news')   # True
+
+Callers outside the engine (the board) import :func:`enabled` and pass the home
+explicitly, because the board is launched by launchd from a project dir and has
+no ``$TIDE_HOME`` to climb from.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Dict, List, NamedTuple, Optional, Set
+
+from . import io as _io, paths
+from .arc.stream import StreamError
+
+REGISTRY_FILE = "plugins"
+
+
+class Part(NamedTuple):
+    """One named part of the stack.
+
+    ``name``     stable id — what goes in the registry file and in ``tide plugins``
+    ``title``    what a human calls it
+    ``note``     one line saying what it is and where it lives
+    ``core``     True → shipped, not switchable
+    ``default``  for plugins: the state when the registry says nothing
+    ``planned``  True → a place held open, no code behind it yet
+    """
+
+    name: str
+    title: str
+    note: str
+    core: bool = False
+    default: bool = True
+    planned: bool = False
+
+
+# --- the catalogue ---------------------------------------------------------
+# CORE — what "tide" means. Not switchable: there is no install without these.
+
+CORE: List[Part] = [
+    Part("projects", "projects",
+         "homes in the roster: create, adopt, switch", core=True),
+    Part("threads", "threads",
+         "a thread and its base structure input/output/workspace", core=True),
+    Part("cli", "verbs",
+         "tide commands — the only way to edit .tide/", core=True),
+    Part("board", "board frame",
+         "tide board on localhost: streams of the home and projects; the tab "
+         "row on top belongs to the live board",
+         core=True),
+    Part("system-skills", "system skills",
+         "method skills (tide-flow, handoff, offload), installed by tide install-skills",
+         core=True),
+    Part("hooks", "hooks",
+         "session entry and exit, edit and role gates", core=True),
+]
+
+# PLUGINS — removable. Everything here defaults ON, because every existing
+# install already has it; a fresh install is what starts from core-only (see
+# :func:`seed_new_install`).
+
+PLUGINS: List[Part] = [
+    Part("issues", "issues",
+         "the inbox desk — a kind of thread structure (the live board draws "
+         "the 'issues' tab; tide board does not show it)"),
+    Part("work", "works",
+         "human↔agent agreement — a kind of thread structure; tide board "
+         "shows the work cards too"),
+    Part("canon", "canon",
+         "the project's rulebook — a kind of thread structure; .tide/canon/"),
+    Part("news", "news",
+         "inbox feed and triage pipeline (the live board draws the 'news' "
+         "tab; tide board does not show it)"),
+    Part("pages", "pages",
+         "drawing pad — canvas, strokes, images (the live board draws the tab; "
+         "tide board does not show it)"),
+    Part("skills", "skills",
+         "skill showcase, global and per project (the live board draws the "
+         "'skills' tab; tide board does not show it)"),
+]
+
+ALL: List[Part] = CORE + PLUGINS
+_BY_NAME: Dict[str, Part] = {p.name: p for p in ALL}
+
+
+class PluginError(StreamError):
+    """An unknown plugin name, or an attempt to switch a core part off.
+
+    Subclasses :class:`tide.arc.stream.StreamError` so ``cli.main`` catches it on
+    the same arm as every other tide error (prints ``tide: …``, exits nonzero).
+    """
+
+
+def part(name: str) -> Optional[Part]:
+    """The catalogue entry for *name*, or None when the name is unknown."""
+    return _BY_NAME.get((name or "").strip().lower())
+
+
+def is_core(name: str) -> bool:
+    p = part(name)
+    return bool(p and p.core)
+
+
+def plugin_names() -> List[str]:
+    """Names of the removable parts, in catalogue order."""
+    return [p.name for p in PLUGINS]
+
+
+def default_enabled() -> Set[str]:
+    """What is on when the registry says nothing — every non-planned plugin.
+
+    This is the answer to "no registry = everything on", and the reason an
+    install that predates this module sees no change at all.
+    """
+    return {p.name for p in PLUGINS if p.default and not p.planned}
+
+
+# --- the switchboard file --------------------------------------------------
+
+def registry_file(home: Optional[Path] = None) -> Path:
+    """Path to ``<control-home>/.tide/plugins``.
+
+    *home* may be given explicitly (the board does that — it is launched from a
+    project dir and cannot climb to the control-home). Otherwise resolution goes
+    through :func:`tide.paths.control_home`, i.e. ``$TIDE_HOME`` then the climb.
+    """
+    root = Path(home) if home is not None else paths.control_home()
+    return paths.tide_dir(root) / REGISTRY_FILE
+
+
+HEADER = """\
+# tide plugins — what is switched on for this person.
+#
+# A line "name = on" switches a part on, "name = off" switches it off. A line
+# starting with # is a comment. No file or no line — the part is ON: an empty
+# registry takes nothing away.
+#
+# Core — cannot be switched off, it needs no lines here:
+{core}
+#
+# Removable parts:
+"""
+
+
+def _core_comment() -> str:
+    return "\n".join(
+        "#   {0:<14} {1}".format(p.name, p.note) for p in CORE
+    )
+
+
+def render(state: Dict[str, bool]) -> str:
+    """Render the whole registry file from a name → on/off map.
+
+    Every known plugin gets a line with its note above it, so the file reads as
+    documentation of what can be switched, not as an opaque config.
+    """
+    out = [HEADER.format(core=_core_comment())]
+    for p in PLUGINS:
+        on = state.get(p.name, p.default and not p.planned)
+        tail = "   # no place for it yet — a placeholder" if p.planned else ""
+        out.append("\n# {0} — {1}{2}\n{3} = {4}\n".format(
+            p.title, p.note, tail, p.name, "on" if on else "off"))
+    return "".join(out)
+
+
+def _parse(text: str) -> Dict[str, bool]:
+    """Parse ``name = on|off`` lines. Anything unparseable is skipped silently.
+
+    Silently, on purpose: a typo in this file must not cost someone their board.
+    ``tide plugins`` is where unknown names get reported to the human.
+    """
+    state: Dict[str, bool] = {}
+    for raw in (text or "").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        name = name.strip().lower()
+        value = value.strip().lower()
+        if value in ("on", "1", "true", "yes"):
+            state[name] = True
+        elif value in ("off", "0", "false", "no"):
+            state[name] = False
+    return state
+
+
+def read_registry(home: Optional[Path] = None) -> Dict[str, bool]:
+    """Raw parsed registry (may contain unknown names), or ``{}`` when absent.
+
+    Never raises: a missing home, a missing file, a permission error and an
+    undecodable file all read back as "nothing said".
+    """
+    try:
+        f = registry_file(home)
+        if not f.is_file():
+            return {}
+        return _parse(f.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def enabled(home: Optional[Path] = None) -> Set[str]:
+    """The set of plugin names that are ON for this person.
+
+    Starts from :func:`default_enabled` and applies only the lines the registry
+    actually states, ignoring names that are not in the catalogue and any line
+    naming a core part (core cannot be switched off, and a stray ``board = off``
+    must not blank someone's screen).
+
+    Never raises. This is the function the board calls on every request.
+    """
+    try:
+        state = read_registry(home)
+        on = default_enabled()
+        for name, value in state.items():
+            p = _BY_NAME.get(name)
+            if p is None or p.core:
+                continue
+            if value:
+                on.add(name)
+            else:
+                on.discard(name)
+        return on
+    except Exception:
+        return default_enabled()
+
+
+def is_enabled(name: str, home: Optional[Path] = None) -> bool:
+    """True when *name* is a core part, or a plugin switched on for this person."""
+    if is_core(name):
+        return True
+    return name in enabled(home)
+
+
+def unknown_names(home: Optional[Path] = None) -> List[str]:
+    """Names present in the registry file that the catalogue does not know."""
+    return sorted(n for n in read_registry(home) if n not in _BY_NAME)
+
+
+# --- writing ---------------------------------------------------------------
+
+def write_registry(state: Dict[str, bool], home: Optional[Path] = None) -> Path:
+    """Rewrite the registry file from *state*, returning the path written."""
+    f = registry_file(home)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    _io.atomic_write(f, render(state))
+    return f
+
+
+def set_plugin(name: str, on: bool, home: Optional[Path] = None) -> Path:
+    """Switch one plugin on/off — the one gesture behind ``tide plugins on|off``.
+
+    Writes the FULL file (every plugin with its note), not just the touched
+    line: the first switch a person flips is also the moment they get a readable
+    list of everything else they could flip.
+    """
+    p = part(name)
+    if p is None:
+        raise PluginError(
+            "plugins: unknown part {0!r} (known: {1})".format(
+                name, ", ".join(plugin_names())))
+    if p.core:
+        raise PluginError(
+            "plugins: {0} is core — it does not switch off".format(p.name))
+    state = {q.name: (q.name in enabled(home)) for q in PLUGINS}
+    state[p.name] = on
+    return write_registry(state, home)
+
+
+#: What a fresh install does NOT get: the parts that are one person's own
+#: rather than the stack's. The news feed is pinned to its author's own project
+#: and published site; the drawing canvas reaches for a picture-generation token
+#: in their keychain. Everything else in the catalogue is machinery anybody's
+#: home can use on day one.
+SEEDED_OFF: Set[str] = {"news", "pages"}
+
+
+def seed_new_install(home: Optional[Path] = None) -> Path:
+    """Write the registry a fresh install gets: the board the box promises,
+    minus the parts that belong to one person.
+
+    NOT "everything off". What the box hands over is threads, the inbox desk
+    with its "needs you now" card, works and projects — so ``issues``,
+    ``work``, ``skills`` and ``canon`` start ON. Seeded off, every one of those
+    tabs would be missing and a new person would open an offcut and reasonably
+    call it broken. What stays off is :data:`SEEDED_OFF`.
+
+    Deliberately NOT called from anywhere automatic in an existing home: the
+    absence of the file is what keeps an existing board unchanged, and creating
+    a file that says ``off`` everywhere would be exactly the change we promised
+    not to make.
+    """
+    return write_registry(
+        {p.name: (p.default and not p.planned and p.name not in SEEDED_OFF)
+         for p in PLUGINS},
+        home,
+    )
+
+
+# --- CLI wiring ------------------------------------------------------------
+
+def _fmt_row(p: Part, on: bool) -> str:
+    if p.core:
+        mark = "core"
+    elif p.planned:
+        mark = "—  " if not on else "on "
+    else:
+        mark = "on " if on else "off"
+    return "  {0}  {1:<14} {2}".format(mark, p.name, p.note)
+
+
+def _cmd_plugins(args) -> int:
+    home = paths.control_home()
+    action = getattr(args, "action", None)
+    if action in ("on", "off"):
+        f = set_plugin(args.name, action == "on", home)
+        print("tide: {0} → {1}  ({2})".format(args.name, action, f))
+        # A plugin's skill rides its plugin — deliver/retract it in the
+        # SAME gesture, so the person never has to remember a second command
+        #. Best-effort: a machine with no source
+        # checkout / no skills dir still gets its registry flip.
+        try:
+            from .skills_install import install_skills
+
+            for name, verdict in install_skills():
+                if verdict in ("linked", "copied", "replaced") or verdict.startswith("removed"):
+                    print("tide: skill {0}: {1}".format(name, verdict))
+        except Exception:  # noqa: BLE001 — the flip must not die on skill delivery
+            pass
+        return 0
+    if action == "where":
+        print(registry_file(home))
+        return 0
+    on = enabled(home)
+    f = registry_file(home)
+    print("core — always:")
+    for p in CORE:
+        print(_fmt_row(p, True))
+    print("\nremovable:")
+    for p in PLUGINS:
+        print(_fmt_row(p, p.name in on))
+    print("\nregistry: {0}{1}".format(f, "" if f.is_file() else "  (no file — everything on)"))
+    strays = unknown_names(home)
+    if strays:
+        print("unknown names in the registry (skipped): {0}".format(", ".join(strays)))
+    return 0
+
+
+def register(subparsers) -> None:
+    """Add ``tide plugins [on|off <name>|where]`` (called by cli.py)."""
+    p = subparsers.add_parser(
+        "plugins", help="what is core, what is removable, what is on here")
+    sub = p.add_subparsers(dest="action")
+    for act, helptext in (("on", "switch a plugin on"), ("off", "switch a plugin off")):
+        s = sub.add_parser(act, help=helptext)
+        s.add_argument("name", help="plugin name (see `tide plugins`)")
+        s.set_defaults(func=_cmd_plugins, _cmd="plugins")
+    w = sub.add_parser("where", help="print the registry file path")
+    w.set_defaults(func=_cmd_plugins, _cmd="plugins")
+    p.set_defaults(func=_cmd_plugins, _cmd="plugins")

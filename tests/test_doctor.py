@@ -1,0 +1,413 @@
+"""`tide doctor` health/diagnostic checks (unit level).
+
+Each check is a pure-ish function returning a :class:`tide.doctor.CheckResult`
+(ok | warn | fail + a human line). We test the PASS case and the FAIL case for
+every check, plus the aggregate report's exit-code contract (0 = no fail, nonzero
+= at least one fail). The self-update channel probe is exercised offline-tolerant:
+a network failure reports *unreachable* (warn), never crashes — and is NEVER run
+implicitly (only the explicit doctor invocation calls it).
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import List, Optional
+
+import pytest
+
+from tide import doctor
+from tide.hooks import install
+from tide.update.source import LocalSourceCheckout, PublishedChannelSource
+
+
+# --- fakes (mirror tests/test_update_published.py — never touch the network) --
+
+
+class _FakeResp:
+    def __init__(self, payload: bytes):
+        self._buf = payload
+
+    def read(self, amt=None) -> bytes:
+        # DRAIN the buffer honouring amt (mirrors HTTPResponse.read(amt) → b"" at
+        # EOF) so the bounded, looping reader terminates instead of re-reading
+        # forever. Kept in sync with tests/test_update_published.py::_FakeResp.
+        amt = len(self._buf) if amt is None else amt
+        out, self._buf = self._buf[:amt], self._buf[amt:]
+        return out
+
+    def __enter__(self) -> "_FakeResp":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+def _opener(payload: bytes):
+    def _open(req, timeout=None):
+        return _FakeResp(payload)
+
+    return _open
+
+
+def _boom_opener(req, timeout=None):
+    raise OSError("network down")
+
+
+def _feed(tag: str) -> bytes:
+    return json.dumps({"tag_name": tag}).encode("utf-8")
+
+
+def _published(tmp_path: Path, *, opener) -> PublishedChannelSource:
+    return PublishedChannelSource(
+        python_exe="/py",
+        marker_path=tmp_path / "install-marker.json",
+        cache_path=tmp_path / "cache.json",
+        rollback_path=tmp_path / "rollback.json",
+        repo="current-harness/current-harness",
+        opener=opener,
+    )
+
+
+# --- python check ----------------------------------------------------------
+
+
+def test_check_python_passes_on_supported_interpreter():
+    res = doctor.check_python(version_info=(3, 12, 1))
+    assert res.status == doctor.STATUS_OK
+    assert "3.12" in res.detail
+
+
+def test_check_python_fails_on_too_old_interpreter():
+    res = doctor.check_python(version_info=(3, 10, 9))
+    assert res.status == doctor.STATUS_FAIL
+    assert "3.10" in res.detail
+
+
+# --- .tide structure check -------------------------------------------------
+
+
+def test_check_structure_passes_on_intact_skeleton(tmp_project):
+    res = doctor.check_structure(tmp_project)
+    assert res.status == doctor.STATUS_OK
+
+
+def test_check_structure_fails_when_no_tide_root():
+    res = doctor.check_structure(None)
+    assert res.status == doctor.STATUS_FAIL
+
+
+def test_check_structure_fails_on_missing_subdir(tmp_project):
+    # Remove an expected dir → structure is broken.
+    import shutil
+
+    shutil.rmtree(tmp_project / ".tide" / "arcs")
+    res = doctor.check_structure(tmp_project)
+    assert res.status == doctor.STATUS_FAIL
+    assert "arcs" in res.detail
+
+
+# --- canon readable check --------------------------------------------------
+
+
+def _written_canon(tmp_project, extra=""):
+    """A canon with REAL content in every section (journal stays empty by design)."""
+    (tmp_project / ".tide" / "canon" / "CANON.md").write_text(
+        "# CANON.md — demo\n\n"
+        "## What it is\nA demo project for tests.\n\n"
+        "## State & components\nOne module, one test.\n\n"
+        "## Interfaces / how used\nRun it.\n{0}\n"
+        "## Canon journal\n".format(extra),
+        encoding="utf-8",
+    )
+
+
+def test_check_canon_passes_on_written_canon(tmp_project):
+    _written_canon(tmp_project)
+    res = doctor.check_canon(tmp_project)
+    assert res.status == doctor.STATUS_OK
+
+
+def test_check_canon_warns_on_empty_skeleton(tmp_project):
+    # A fresh `canon init` skeleton: all sections present, all bodies blank.
+    # Saying OK over it teaches people to trust an empty file — warn, honestly.
+    res = doctor.check_canon(tmp_project)
+    assert res.status == doctor.STATUS_WARN
+    assert "empty skeleton" in res.detail
+
+
+def test_check_canon_warns_on_leftover_placeholders(tmp_project):
+    _written_canon(tmp_project, extra="\n<fill in the deploy story>\n")
+    res = doctor.check_canon(tmp_project)
+    assert res.status == doctor.STATUS_WARN
+    assert "placeholder" in res.detail
+
+
+def test_check_canon_empty_journal_is_fine(tmp_project):
+    # The journal is the merge anchor — intentionally empty in a fresh canon.
+    _written_canon(tmp_project)
+    res = doctor.check_canon(tmp_project)
+    assert res.status == doctor.STATUS_OK
+
+
+def test_check_canon_fails_when_canon_missing(tmp_project):
+    (tmp_project / ".tide" / "canon" / "CANON.md").unlink()
+    res = doctor.check_canon(tmp_project)
+    assert res.status == doctor.STATUS_FAIL
+
+
+def test_check_canon_warns_on_partial_sections(tmp_project):
+    # A readable but skeletal canon missing the canonical sections → warn, not fail.
+    (tmp_project / ".tide" / "canon" / "CANON.md").write_text(
+        "# CANON.md — demo\n\n## What it is\n", encoding="utf-8"
+    )
+    res = doctor.check_canon(tmp_project)
+    assert res.status == doctor.STATUS_WARN
+
+
+# --- hooks wired check -----------------------------------------------------
+
+
+def test_check_hooks_passes_when_wired(tmp_project):
+    install.install_hooks(tmp_project)  # writes .claude/settings.json
+    res = doctor.check_hooks(tmp_project)
+    assert res.status == doctor.STATUS_OK
+
+
+def test_check_hooks_warns_when_not_installed(tmp_project):
+    res = doctor.check_hooks(tmp_project)
+    assert res.status == doctor.STATUS_WARN
+
+
+def test_check_hooks_fails_on_invalid_settings_json(tmp_project):
+    settings = install.settings_path(tmp_project)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text("{not json", encoding="utf-8")
+    res = doctor.check_hooks(tmp_project)
+    assert res.status == doctor.STATUS_FAIL
+
+
+# --- install-marker valid check --------------------------------------------
+
+
+def test_check_install_marker_passes_on_valid_marker(tmp_path):
+    marker = tmp_path / "install-marker.json"
+    marker.write_text(json.dumps({"version": "1.0.3", "commit": "abc"}), encoding="utf-8")
+    res = doctor.check_install_marker(marker_path=marker, running="1.0.3")
+    assert res.status == doctor.STATUS_OK
+    assert "1.0.3" in res.detail
+
+
+def test_check_install_marker_warns_when_absent(tmp_path):
+    res = doctor.check_install_marker(marker_path=tmp_path / "nope.json")
+    assert res.status == doctor.STATUS_WARN
+
+
+def test_check_install_marker_fails_on_corrupt_marker(tmp_path):
+    marker = tmp_path / "install-marker.json"
+    marker.write_text("{garbage", encoding="utf-8")
+    res = doctor.check_install_marker(marker_path=marker)
+    assert res.status == doctor.STATUS_FAIL
+
+
+def test_check_install_marker_fails_when_version_missing(tmp_path):
+    marker = tmp_path / "install-marker.json"
+    marker.write_text(json.dumps({"commit": "abc"}), encoding="utf-8")
+    res = doctor.check_install_marker(marker_path=marker)
+    assert res.status == doctor.STATUS_FAIL
+
+
+# --- self-update channel reachable check -----------------------------------
+
+
+def test_check_channel_ok_for_local_source(tmp_path):
+    src = LocalSourceCheckout(
+        source_dir=tmp_path,  # is_dir() → reachable, no network
+        python_exe="/py",
+        editable=True,
+        marker_path=tmp_path / "marker.json",
+    )
+    res = doctor.check_channel(source=src)
+    assert res.status == doctor.STATUS_OK
+    assert "local-source" in res.detail
+
+
+def test_check_channel_ok_for_reachable_published(tmp_path):
+    src = _published(tmp_path, opener=_opener(_feed("v1.0.3")))
+    res = doctor.check_channel(source=src)
+    assert res.status == doctor.STATUS_OK
+    assert "reachable" in res.detail.lower()
+
+
+def test_check_channel_warns_when_published_unreachable(tmp_path):
+    # Offline / network down must REPORT unreachable (warn), never crash.
+    src = _published(tmp_path, opener=_boom_opener)
+    res = doctor.check_channel(source=src)
+    assert res.status == doctor.STATUS_WARN
+    assert "unreachable" in res.detail.lower()
+
+
+def test_check_channel_skips_network_when_disabled(tmp_path):
+    # --no-network: report the configured source WITHOUT touching the channel.
+    src = _published(tmp_path, opener=_boom_opener)  # would raise if probed
+    res = doctor.check_channel(source=src, network=False)
+    assert res.status == doctor.STATUS_OK
+    assert "skipped" in res.detail.lower()
+
+
+def test_check_channel_warns_when_no_source():
+    res = doctor.check_channel(source=None)
+    assert res.status == doctor.STATUS_WARN
+
+
+# --- the public reachability CONTRACT (doctor calls probe_reachable) --------
+
+
+class _StubSource:
+    """A minimal VersionSource: only name() + the PUBLIC probe_reachable() contract.
+
+    Proves doctor routes through the public method (not a concrete class or a
+    private internal) — a source need implement nothing else to be probed.
+    """
+
+    def __init__(self, result=None, raises: bool = False):
+        self._result = result
+        self._raises = raises
+
+    def name(self) -> str:
+        return "stub-source"
+
+    def probe_reachable(self):
+        if self._raises:
+            raise RuntimeError("boom")
+        return self._result
+
+
+def test_check_channel_uses_public_probe_contract_ok():
+    res = doctor.check_channel(source=_StubSource((True, "all good")))
+    assert res.status == doctor.STATUS_OK
+    assert "all good" in res.detail
+
+
+def test_check_channel_uses_public_probe_contract_unreachable():
+    res = doctor.check_channel(source=_StubSource((False, "nope")))
+    assert res.status == doctor.STATUS_WARN
+    assert "nope" in res.detail
+
+
+def test_check_channel_warns_not_crashes_when_probe_raises():
+    # A source whose PUBLIC probe violates the contract by raising must degrade to
+    # a WARN naming the error — never crash the diagnostic.
+    res = doctor.check_channel(source=_StubSource(raises=True))
+    assert res.status == doctor.STATUS_WARN
+    assert "boom" in res.detail
+
+
+def test_concrete_sources_implement_the_public_probe():
+    # Guard the contract at the source side: both shipped sources expose the public
+    # method, so a rename surfaces as an interface/test error, not a silent swallow.
+    from tide.update.source import LocalSourceCheckout as _Local
+    from tide.update.source import PublishedChannelSource as _Pub
+
+    assert callable(getattr(_Local, "probe_reachable", None))
+    assert callable(getattr(_Pub, "probe_reachable", None))
+
+
+# --- aggregate report + exit-code contract ---------------------------------
+
+
+def test_run_doctor_no_fail_exits_zero(tmp_project, tmp_path):
+    # The report may carry WARNs (no source) — what matters is that NO check FAILed.
+    marker = tmp_path / "install-marker.json"
+    marker.write_text(json.dumps({"version": "1.0.3"}), encoding="utf-8")
+    install.install_hooks(tmp_project)
+    report = doctor.run_doctor(
+        tmp_project,
+        marker_path=marker,
+        source=None,         # no source → warn (not fail)
+        network=False,
+    )
+    assert report.exit_code == 0
+    assert report.ok is True
+    assert not any(r.status == doctor.STATUS_FAIL for r in report.results)
+    # every check produced a line
+    names = {r.name for r in report.results}
+    assert {"python", "structure", "canon", "hooks", "install-marker", "channel"} <= names
+
+
+def test_run_doctor_nonzero_when_a_check_fails(tmp_path):
+    # No .tide root → structure + canon fail → nonzero exit (scriptable).
+    report = doctor.run_doctor(
+        None,
+        marker_path=tmp_path / "absent.json",
+        source=None,
+        network=False,
+    )
+    assert report.exit_code != 0
+    assert report.ok is False
+
+
+def test_run_doctor_warn_does_not_trip_exit_code(tmp_project, tmp_path):
+    # hooks not wired (warn) + no marker (warn) must NOT make doctor exit nonzero.
+    report = doctor.run_doctor(
+        tmp_project,
+        marker_path=tmp_path / "absent.json",
+        source=None,
+        network=False,
+    )
+    assert report.exit_code == 0
+    assert any(r.status == doctor.STATUS_WARN for r in report.results)
+
+
+# --- roster worktree-ready ----------------------------------------
+
+
+def _git(cwd, *args):
+    import subprocess
+    subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, check=True)
+
+
+def test_roster_worktrees_warns_on_headless_repo(tmp_path):
+    from tide import roster
+
+    home = tmp_path / "home"
+    home.mkdir()
+    good = tmp_path / "good"; good.mkdir()
+    _git(good, "init", "-q")
+    _git(good, "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-q", "--allow-empty", "-m", "root")
+    bad = tmp_path / "bad"; bad.mkdir()
+    _git(bad, "init", "-q")  # git init without a commit — a known trap
+    roster.add(home, "good", str(good))
+    roster.add(home, "bad", str(bad))
+    res = doctor.check_roster_worktrees(home)
+    assert res.status == doctor.STATUS_WARN
+    assert "bad" in res.detail and "adopt" in res.detail
+    assert "good (" not in res.detail
+
+
+def test_roster_worktrees_ok_and_empty(tmp_path):
+    from tide import roster
+
+    home = tmp_path / "home"
+    home.mkdir()
+    assert doctor.check_roster_worktrees(home).status == doctor.STATUS_OK
+    good = tmp_path / "p"; good.mkdir()
+    _git(good, "init", "-q")
+    _git(good, "-c", "user.email=t@t", "-c", "user.name=t",
+         "commit", "-q", "--allow-empty", "-m", "root")
+    roster.add(home, "p", str(good))
+    res = doctor.check_roster_worktrees(home)
+    assert res.status == doctor.STATUS_OK
+
+
+def test_marker_older_than_the_running_code_is_a_warn_with_the_fix(tmp_path):
+    """Five releases passed with every surface quoting a stale number — say it."""
+    marker = tmp_path / "install-marker.json"
+    marker.write_text(json.dumps({"version": "1.0.43"}), encoding="utf-8")
+    res = doctor.check_install_marker(marker_path=marker, running="1.0.48")
+    assert res.status == doctor.STATUS_WARN
+    assert "1.0.43" in res.detail and "1.0.48" in res.detail
+    assert "reinstall" in res.detail
+
+

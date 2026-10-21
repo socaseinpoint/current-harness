@@ -1,0 +1,306 @@
+"""18-self-update — the ``tide self-update`` CLI surface + SessionStart wiring.
+
+The handler is argparse + printing; we stub ``resolve_source`` so no real
+install ever runs, and assert the exit-code contract (--check tri-state) + that
+SessionStart SURFACES an available update (never applies it).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List
+
+import pytest
+
+from tide import cli
+from tide.update import commands, core
+from tide.update.source import Revision
+
+
+@dataclass
+class FakeSource:
+    installed_rev: Revision
+    available_rev: Revision
+    source_dir: Path = Path("/src")
+    python_exe: str = "/py"
+    recorded: List[Revision] = field(default_factory=list)
+
+    def name(self) -> str:
+        return "fake"
+
+    def installed(self) -> Revision:
+        return self.installed_rev
+
+    def available(self) -> Revision:
+        return self.available_rev
+
+    def install_command(self) -> List[str]:
+        return [self.python_exe, "-m", "pip", "install", "--upgrade", str(self.source_dir)]
+
+    def record_install(self) -> Revision:
+        self.recorded.append(self.available_rev)
+        return self.available_rev
+
+
+def _stale():
+    return FakeSource(Revision("0.1.0", "old"), Revision("0.2.0", "new"))
+
+
+def _current():
+    rev = Revision("0.2.0", "new")
+    return FakeSource(rev, rev)
+
+
+# --- --check tri-state exit code -------------------------------------------
+
+
+def test_check_exit_0_when_current(monkeypatch, capsys):
+    monkeypatch.setattr(commands, "resolve_source", lambda: _current())
+    rc = cli.main(["self-update", "--check"])
+    assert rc == 0
+    assert "current" in capsys.readouterr().out
+
+
+def test_check_exit_1_when_stale(monkeypatch, capsys):
+    monkeypatch.setattr(commands, "resolve_source", lambda: _stale())
+    rc = cli.main(["self-update", "--check"])
+    assert rc == 1
+    assert "UPDATE AVAILABLE" in capsys.readouterr().out
+
+
+def test_exit_2_when_no_source(monkeypatch, capsys):
+    monkeypatch.setattr(commands, "resolve_source", lambda: None)
+    rc = cli.main(["self-update", "--check"])
+    assert rc == 2
+    assert "no update source" in capsys.readouterr().out
+
+
+# --- --dry-run --------------------------------------------------------------
+
+
+def test_dry_run_shows_command_and_acts_not(monkeypatch, capsys):
+    source = _stale()
+    monkeypatch.setattr(commands, "resolve_source", lambda: source)
+    rc = cli.main(["self-update", "--dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "would run" in out
+    assert "pip" in out
+    assert source.recorded == []  # nothing applied
+
+
+# --- default flow (gate stubbed via runner-less self_update) ----------------
+
+
+def test_default_flow_accepts_on_green_gate(monkeypatch, capsys):
+    source = _stale()
+    monkeypatch.setattr(commands, "resolve_source", lambda: source)
+
+    def fake_self_update(src, **kw):
+        return core.SelfUpdateResult(
+            source_name=src.name(),
+            installed=src.installed(),
+            available=src.available(),
+            stale=True,
+            accepted=True,
+            applied=True,
+            messages=["accepted — installed + stamped"],
+        )
+
+    monkeypatch.setattr(core, "self_update", fake_self_update)
+    rc = cli.main(["self-update"])
+    assert rc == 0
+    assert "accepted" in capsys.readouterr().out
+
+
+def test_default_flow_returns_1_on_refused(monkeypatch, capsys):
+    source = _stale()
+    monkeypatch.setattr(commands, "resolve_source", lambda: source)
+
+    def refused(src, **kw):
+        return core.SelfUpdateResult(
+            source_name=src.name(),
+            installed=src.installed(),
+            available=src.available(),
+            stale=True,
+            accepted=False,
+            applied=False,
+            messages=["REFUSED — gate is red"],
+        )
+
+    monkeypatch.setattr(core, "self_update", refused)
+    rc = cli.main(["self-update"])
+    assert rc == 1
+    assert "REFUSED" in capsys.readouterr().out
+
+
+# --- SessionStart surfaces an available update (never applies) --------------
+
+
+def test_session_start_surfaces_update(tmp_project, monkeypatch, capsys):
+    from tide.hooks import session_start
+
+    monkeypatch.chdir(tmp_project)
+    monkeypatch.setenv("TIDE_ROLE", "worker")
+    monkeypatch.setattr(
+        session_start, "_update_note", lambda: "  ↑ tide update available: 0.1.0 → 0.2.0"
+    )
+    rc = cli.main(["hook", "session-start"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "UPDATE" in out
+    assert "update available" in out
+
+
+def test_session_start_silent_when_no_update(tmp_project, monkeypatch, capsys):
+    from tide.hooks import session_start
+
+    monkeypatch.chdir(tmp_project)
+    monkeypatch.setenv("TIDE_ROLE", "worker")
+    monkeypatch.setattr(session_start, "_update_note", lambda: None)
+    rc = cli.main(["hook", "session-start"])
+    assert rc == 0
+    assert "UPDATE" not in capsys.readouterr().out
+
+
+# --- published-channel dispatch + --rollback --------------------------------
+
+
+def test_default_flow_dispatches_published_source(monkeypatch, capsys):
+    from tide.update.source import PublishedChannelSource
+
+    source = PublishedChannelSource(
+        python_exe="/py", marker_path=Path("/m"), cache_path=Path("/c"),
+        rollback_path=Path("/r"),
+    )
+    monkeypatch.setattr(commands, "resolve_source", lambda: source)
+
+    seen = {}
+
+    def fake_published(src, **kw):
+        seen["called"] = True
+        return core.SelfUpdateResult(
+            source_name="published-channel",
+            installed=Revision("0.1.0"), available=Revision("1.0.1"),
+            stale=True, accepted=True, applied=True, messages=["accepted"],
+        )
+
+    monkeypatch.setattr(core, "self_update_published", fake_published)
+    rc = cli.main(["self-update"])
+    assert rc == 0
+    assert seen.get("called") is True  # routed to the published flow, not local
+
+
+def test_rollback_flag_invokes_rollback(monkeypatch, capsys):
+    def fake_rollback(path, **kw):
+        return core.RollbackResult(True, target="0.1.0", messages=["rolled back"])
+
+    # rollback is channel-aware now (an editable install has no package to roll
+    # back — see test_rollback_on_editable_points_at_git), so pin a NON-editable
+    # source rather than inheriting whatever the dev machine happens to run.
+    monkeypatch.setattr(commands, "resolve_source", lambda: _current())
+    monkeypatch.setattr(core, "rollback", fake_rollback)
+    rc = cli.main(["self-update", "--rollback"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "rollback" in out
+    assert "rolled back" in out
+
+
+def test_rollback_flag_exit_2_when_no_marker(monkeypatch, capsys):
+    def fake_rollback(path, **kw):
+        return core.RollbackResult(False, target=None, messages=["no rollback marker"])
+
+    monkeypatch.setattr(commands, "resolve_source", lambda: _current())
+    monkeypatch.setattr(core, "rollback", fake_rollback)
+    rc = cli.main(["self-update", "--rollback"])
+    assert rc == 2
+
+
+# --- the CLI surface + a showable rollback ----------------------
+
+
+@dataclass
+class FakeEditableSource(FakeSource):
+    editable: bool = True
+    uv_tool: bool = False
+
+
+def _editable():
+    return FakeEditableSource(Revision("0.1.0", "old"), Revision("0.2.0", "new"))
+
+
+def test_check_on_editable_exits_zero_with_the_word(monkeypatch, capsys):
+    monkeypatch.setattr(commands, "resolve_source", lambda: _editable())
+    rc = cli.main(["self-update", "--check"])
+    out = capsys.readouterr().out
+    assert rc == 0  # NOT 1: there is no update pending on an editable checkout
+    assert "editable install" in out
+    assert "UPDATE AVAILABLE" not in out
+
+
+def test_dry_run_on_editable_shows_noop_not_an_install_command(monkeypatch, capsys):
+    monkeypatch.setattr(commands, "resolve_source", lambda: _editable())
+    rc = cli.main(["self-update", "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "nothing to install" in out
+    assert "would run:" not in out
+
+
+def test_self_update_on_editable_installs_nothing(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(commands, "resolve_source", lambda: _editable())
+    monkeypatch.setattr(core, "_default_runner", lambda *a, **k: calls.append(a) or (0, ""))
+    rc = cli.main(["self-update"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert calls == []
+    assert "no-op" in out
+
+
+def test_rollback_on_editable_points_at_git(monkeypatch, capsys):
+    monkeypatch.setattr(commands, "resolve_source", lambda: _editable())
+    rc = cli.main(["self-update", "--rollback"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "git -C /src checkout" in out
+
+
+def test_rollback_dry_run_shows_the_recovery_point(monkeypatch, tmp_path, capsys):
+    from tide.update.source import write_rollback
+
+    marker = tmp_path / "rollback.json"
+    write_rollback(marker, "1.0.44", ["/py", "-m", "pip", "install", "pinned-url"])
+    monkeypatch.setattr(commands, "resolve_source", lambda: _current())
+    monkeypatch.setattr(commands, "default_rollback_path", lambda: marker)
+    rc = cli.main(["self-update", "--rollback", "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "1.0.44" in out
+    assert "pinned-url" in out
+    assert "nothing applied" in out
+
+
+def test_rollback_dry_run_says_so_when_no_point_recorded(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(commands, "resolve_source", lambda: _current())
+    monkeypatch.setattr(commands, "default_rollback_path", lambda: tmp_path / "nope.json")
+    rc = cli.main(["self-update", "--rollback", "--dry-run"])
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "no rollback point recorded" in out
+
+
+def test_stamp_records_the_source_without_installing(monkeypatch, capsys):
+    # What install.sh calls: a fresh install must not report itself stale.
+    source = _stale()
+    calls = []
+    monkeypatch.setattr(commands, "resolve_source", lambda: source)
+    monkeypatch.setattr(core, "_default_runner", lambda *a, **k: calls.append(a) or (0, ""))
+    rc = cli.main(["self-update", "--stamp"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert calls == []                       # nothing was gated, nothing installed
+    assert source.recorded == [source.available_rev]
+    assert "recorded" in out

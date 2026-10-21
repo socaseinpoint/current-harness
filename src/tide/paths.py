@@ -1,0 +1,309 @@
+"""tide.paths — resolve the per-project ``.tide/`` home and name the install dirs.
+
+Every module that touches disk routes through here so the on-disk layout
+(`build-blueprint.md` ``tide_dir_format``) lives in exactly one place:
+
+    <project>/.tide/
+      canon/    CANON.md + config            durable truth
+      arcs/     NN-<slug>/ work stream        + candidates/ (separate seq)
+      state/    strictness + canon-rev stamps + contract index
+
+The control-home (where ``tide init`` ran) additionally carries a top-level
+``roster.md`` and its own dogfood ``.tide/``.
+
+Resolution is ancestor-walking (like git finding ``.git``): from a start dir we
+climb until we find one that contains ``.tide/``. That dir is the *project root*;
+``.tide`` is its meta dir.
+
+Global install dirs (canonical ``prompts/`` + ``rules/`` shipped with the tool)
+are computed relative to this package so a source checkout works without install.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Optional
+
+# --- on-disk names (single source of truth) --------------------------------
+TIDE_DIR = ".tide"
+ROSTER_FILE = "roster.md"
+
+# Env var pointing at the control-home, so `tide` resolves the roster from any
+# cwd (not only when run inside the control-home tree). See :func:`control_home`.
+TIDE_HOME_ENV = "TIDE_HOME"
+
+CANON_DIRNAME = "canon"          # new canonical spelling
+CANNON_DIRNAME = "cannon"        # legacy spelling — for back-compat detection only
+ARCS_DIRNAME = "arcs"
+STATE_DIRNAME = "state"
+CANDIDATES_DIRNAME = "candidates"
+
+CANON_FILE = "CANON.md"
+CONFIG_FILE = "config"
+STRICTNESS_FILE = "strictness"
+CONTEXT_FILE = "context.json"
+MCP_FILE = "mcp.json"
+DEFERRED_FILE = "deferred.md"
+
+
+# --- project-root resolution -----------------------------------------------
+
+def find_tide_root(start: Optional[Path] = None) -> Optional[Path]:
+    """Return the nearest ancestor of *start* that contains ``.tide/``, or None.
+
+    The search is inclusive of *start* itself and climbs to the filesystem root.
+    The returned path is the **project root** (the dir holding ``.tide``), not
+    the ``.tide`` dir. *start* defaults to the current working directory.
+    """
+    here = Path(start).resolve() if start is not None else Path.cwd().resolve()
+    for candidate in (here, *here.parents):
+        if not_project_root(candidate):
+            # Home and everything above it is not a project: ~/.tide holds global files
+            # (global config, state/), and walking up to it turned any repo without its
+            # own .tide into a "project" (the edit-gate blocked with "no open arc").
+            return None
+        if (candidate / TIDE_DIR).is_dir():
+            return candidate
+    return None
+
+
+def _home_dir() -> Optional[Path]:
+    try:
+        return Path.home().resolve()
+    except (RuntimeError, KeyError, OSError):
+        return None
+
+
+def not_project_root(candidate: Path) -> bool:
+    """True when *candidate* is ``$HOME`` or one of its ancestors — never a project.
+
+    The home dir may carry a ``~/.tide`` of global files (the TG pult's
+    ``manager.json``, ``state/``); treating it as a project root would make every
+    repo under ``$HOME`` without its own ``.tide`` look like a tide project.
+    """
+    home = _home_dir()
+    if home is None:
+        return False
+    cand = Path(candidate)
+    return cand == home or cand in home.parents
+
+
+def require_tide_root(start: Optional[Path] = None) -> Path:
+    """Like :func:`find_tide_root` but raise a clear error when none is found."""
+    root = find_tide_root(start)
+    if root is None:
+        where = Path(start).resolve() if start is not None else Path.cwd().resolve()
+        raise FileNotFoundError(
+            "no .tide/ found in {0} or any parent "
+            "(run 'tide init' to unfold a control-home)".format(where)
+        )
+    return root
+
+
+def control_home(start: Optional[Path] = None) -> Path:
+    """Resolve the control-home, preferring ``$TIDE_HOME`` over the cwd climb.
+
+    This is the entry point for commands that operate on the **roster** (``tide
+    menu``, ``tide roster``): they must work from any directory, not only from
+    inside the control-home tree. Resolution order:
+
+    1. ``$TIDE_HOME`` — if set, it must point at an existing directory (the
+       control-home); a stale/missing path is a clear error, not a silent
+       fall-through to the cwd climb.
+    2. Otherwise climb from *start* for a REAL control-home — a dir carrying
+       ``roster.md`` (:func:`is_control_home`), NOT just any ``.tide/``. A plain
+       project (which has its own ``.tide/``) must never be mistaken for the
+       control-home, or it would scatter a stray roster there.
+    """
+    env = os.environ.get(TIDE_HOME_ENV)
+    if env and env.strip():
+        home = Path(env).expanduser()
+        if not home.is_dir():
+            raise FileNotFoundError(
+                "{0} points at {1}, which is not a directory".format(
+                    TIDE_HOME_ENV, home
+                )
+            )
+        return home.resolve()
+    here = Path(start).resolve() if start is not None else Path.cwd().resolve()
+    for candidate in (here, *here.parents):
+        if is_control_home(candidate):
+            return candidate
+    # a launchd process without $TIDE_HOME silently failed spark with "no control-home". The
+    # fallback is the same TIDE_HOME that com.tide.env puts into launchd (launchctl setenv).
+    fallback = launchd_tide_home()
+    if fallback is not None:
+        return fallback
+    raise FileNotFoundError(
+        "no control-home (a dir with roster.md) found in {0} or any parent — "
+        "set $TIDE_HOME to your control-home".format(here)
+    )
+
+
+LAUNCHD_ENV = "TIDE_HOME_LAUNCHD"
+_LAUNCHD_CACHE: list = []
+
+
+def launchd_tide_home() -> Optional[Path]:
+    """``launchctl getenv TIDE_HOME`` → control-home, if it is a real control-home
+    (has roster.md); otherwise None. ``$TIDE_HOME_LAUNCHD=off`` turns it off (tests).
+    One launchctl call per process; never raises."""
+    if (os.environ.get(LAUNCHD_ENV) or "").strip().lower() in ("0", "off", "no", "false"):
+        return None
+    if not _LAUNCHD_CACHE:
+        val = ""
+        try:
+            import subprocess
+
+            val = subprocess.run(["/bin/launchctl", "getenv", TIDE_HOME_ENV],
+                                 capture_output=True, text=True, timeout=3).stdout.strip()
+        except Exception:  # noqa: BLE001 — no launchctl (Linux) / timeout
+            val = ""
+        _LAUNCHD_CACHE.append(val)
+    val = _LAUNCHD_CACHE[0]
+    if not val:
+        return None
+    home = Path(val).expanduser()
+    try:
+        return home.resolve() if is_control_home(home) else None
+    except OSError:
+        return None
+
+
+def tide_dir(root: Path) -> Path:
+    """The ``.tide`` meta dir for a project *root*."""
+    return Path(root) / TIDE_DIR
+
+
+# --- per-project subdir helpers (take a project root) ----------------------
+
+def canon_dir(root: Path) -> Path:
+    """The ``.tide/canon/`` dir for *root*, with back-compat legacy resolution.
+
+    Resolution order (read-both back-compat):
+    1. ``.tide/canon/``  exists → return it (new canonical path).
+    2. ``.tide/cannon/`` exists and ``.tide/canon/`` does NOT → return the
+       legacy path so existing instances read correctly without migration.
+    3. Neither exists → return ``.tide/canon/`` (new instances / fresh init).
+
+    The first WRITE that creates the dir should call :func:`migrate_canon_dir`
+    first (atomic rename ``cannon/`` → ``canon/``) so we never end up with two
+    dirs and legacy instances are migrated on the next write.
+    """
+    td = tide_dir(Path(root))
+    new_path = td / CANON_DIRNAME
+    if new_path.is_dir():
+        return new_path
+    legacy_path = td / CANNON_DIRNAME
+    if legacy_path.is_dir():
+        return legacy_path
+    return new_path
+
+
+def migrate_canon_dir(root: Path) -> bool:
+    """Atomically rename ``.tide/cannon/`` → ``.tide/canon/`` when needed.
+
+    Called before the first write to the canon dir so legacy instances are
+    migrated in place. No-op when ``.tide/canon/`` already exists or no legacy
+    dir is present. Returns True when a migration actually happened.
+    """
+    td = tide_dir(Path(root))
+    new_path = td / CANON_DIRNAME
+    legacy_path = td / CANNON_DIRNAME
+    if new_path.is_dir():
+        return False
+    if not legacy_path.is_dir():
+        return False
+    os.rename(str(legacy_path), str(new_path))
+    return True
+
+
+def canon_file(root: Path) -> Path:
+    return canon_dir(root) / CANON_FILE
+
+
+def canon_config(root: Path) -> Path:
+    return canon_dir(root) / CONFIG_FILE
+
+
+def arcs_dir(root: Path) -> Path:
+    return tide_dir(root) / ARCS_DIRNAME
+
+
+def candidates_dir(root: Path) -> Path:
+    return arcs_dir(root) / CANDIDATES_DIRNAME
+
+
+def state_dir(root: Path) -> Path:
+    return tide_dir(root) / STATE_DIRNAME
+
+
+def handoffs_dir(root: Path) -> Path:
+    """Path to the two-stage handoff queue (``.tide/handoffs/``).
+
+    A control-home holds the pending-handoff offers here: each is a small markdown
+    record an offering session writes (status: offered) and a picking-up session
+    confirms (status: taken) — decoupling "chat offered a handoff" from "another
+    chat actually took it" (no reliance on a fragile spawn).
+    """
+    return tide_dir(root) / "handoffs"
+
+
+def strictness_file(root: Path) -> Path:
+    return state_dir(root) / STRICTNESS_FILE
+
+
+def context_file(root: Path) -> Path:
+    """Path to the per-project launch context profile (``state/context.json``)."""
+    return state_dir(root) / CONTEXT_FILE
+
+
+def mcp_file(root: Path) -> Path:
+    """Path to the per-project scoped MCP config (``state/mcp.json``).
+
+    Shape ``{"mcpServers": {<name>: <serverdef>}, "_disabled": {…}}`` — the
+    launch profile's ``mcp_config`` points here when any server is enabled.
+    """
+    return state_dir(root) / MCP_FILE
+
+
+def deferred_file(root: Path) -> Path:
+    """Path to the deferred-reconciliation debt ledger (``.tide/deferred.md``).
+
+    Lives at the ``.tide/`` root (not under ``state/``) so it is a human-visible,
+    git-trackable record of every arc landed ``loose`` that still owes a ``strict``
+    reconciliation — see :mod:`tide.ledger`.
+    """
+    return tide_dir(root) / DEFERRED_FILE
+
+
+# --- control-home --------------------------------------------------------
+
+def roster_file(root: Path) -> Path:
+    """Path to the control-home roster (only the install dir has a real one)."""
+    return Path(root) / ROSTER_FILE
+
+
+def is_control_home(root: Path) -> bool:
+    """True when *root* is a tide control-home (carries ``roster.md``)."""
+    return roster_file(root).is_file()
+
+
+# --- global install dirs (canonical prompts/rules shipped with the tool) ---
+# paths.py lives at <repo>/src/tide/paths.py; the shipped prompts/ and rules/
+# sit at the repo root. parents[2] climbs src/tide → src → <repo>.
+
+def install_root() -> Path:
+    """Repo/install root that ships canonical ``prompts/`` and ``rules/``."""
+    return Path(__file__).resolve().parents[2]
+
+
+def global_prompts_dir() -> Path:
+    """Canonical prompts dir (orchestrator.md / worker.md / user-playbook.md)."""
+    return install_root() / "prompts"
+
+
+def global_rules_dir() -> Path:
+    """Canonical rules dir (subagents.md / canon-sync.md / contract.md)."""
+    return install_root() / "rules"

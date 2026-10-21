@@ -1,0 +1,616 @@
+"""tide.hooks.session_start — the SessionStart head: who am I, role, own thread.
+
+Ported from the arcs ``arcs-hook`` SessionStart banner. the hook
+prints only what THIS session needs on waking — the health line, who it is
+(project · thread · session · goal · cursor), its role, its thread's open
+decisions and the project's warnings — inside :data:`SESSION_BUDGET` bytes. The
+full STREAM board (every thread, candidates, health footer) is no longer inlined:
+it is one command away, ``tide status``, named in the closing line.
+
+:func:`render` is pure (snapshot-testable); :func:`cmd_session_start` is the thin
+handler. Both are defensive: outside a tide project they emit nothing and exit 0
+(a SessionStart hook must never break a session).
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import List, Optional
+
+from .. import fields, paths, slug, sync
+from . import edit_gate
+
+ROLE_REMINDERS = {
+    "orchestrator": (
+        "tide · role: ORCHESTRATOR — you decide and drive `tide …`; "
+        "delegate edits to helpers."
+    ),
+    "worker": (
+        "tide · role: WORKER — you run one open arc: write only to its output/ "
+        "and delta.md; the head merges canon and candidates."
+    ),
+}
+
+
+def _role_reminder(role: str) -> str:
+    """One-line reminder for the active TIDE_ROLE (defaults to the worker line)."""
+    return ROLE_REMINDERS.get(role, ROLE_REMINDERS["worker"])
+
+
+# Drift is deliberately NOT a WARNINGS section: the board's HEALTH footer
+# (``board._health_lines``) already aggregates every drifted entry onto ONE line
+# and now carries the re-stamp command, while this hook was re-listing the same
+# arcs one line each right below it (live: 4 of 5 WARNINGS lines were that echo).
+# One fact, one place — the footer, because it aggregates.
+
+
+def _unmerged_warnings(root: Path) -> List[str]:
+    """Warning lines for CLOSED arcs still carrying an unmerged ``delta.md``."""
+    warnings: List[str] = []
+    for off in sync.unmerged_deltas(root):
+        warnings.append(
+            "  ! unmerged delta: {0} → tide canon merge {1}".format(
+                off.name, slug.entry_slug(off.name)
+            )
+        )
+    return warnings
+
+
+def _deferred_warnings(root: Path) -> List[str]:
+    """The "canon lags" line: arcs landed loose that owe a strict reconciliation.
+
+    A single rolled-up warning (not one-per-arc) with the ONE catch-up command, so
+    the head opens already knowing the canon lags and how to close the gap.
+    """
+    from .. import ledger  # lazy: keep SessionStart light
+
+    debt = ledger.entries(root)
+    if not debt:
+        return []
+    return [
+        "  ⚠ canon lags: {0} arcs landed loose, awaiting strict reconciliation "
+        "({1}) → tide reconcile".format(len(debt), ", ".join(e.arc for e in debt))
+    ]
+
+
+# Contract states that anchor work (a signed/running/output contract IS an arc's
+# binding). A `draft` is unsigned ⇒ NOT yet anchored. Mirrors contract.model.STATES.
+_ANCHORING_CONTRACT_STATES = ("sign", "running", "output")
+
+
+def _has_signed_contract(root: Path) -> bool:
+    """True when any arc carries a contract in a work-anchoring state (sign/running/output).
+
+    Lazy-imports ``contract.lifecycle`` so SessionStart stays light (it otherwise
+    imports only edit_gate/board/paths/slug/sync). An unsigned ``draft`` does not
+    count — only a signed contract anchors work.
+    """
+    from ..contract import lifecycle
+
+    return any(
+        c.get("state") in _ANCHORING_CONTRACT_STATES
+        for c in lifecycle.list_contracts(Path(root))
+    )
+
+
+def _is_newborn(root: Path) -> bool:
+    """True for a just-adopted project: no README yet AND canon still a blank skeleton.
+
+    ``tide adopt`` writes neither a README nor any canon content — only the four-
+    heading skeleton. Reproaching such a project for "readme: drift" scolds the
+    agent for the absence of something that should not exist yet. Once ANY canon is
+    written (or a README exists at all), this is no longer a newborn and the normal
+    drift rules apply. Defensive: any read problem ⇒ not newborn (stay loud).
+    """
+    try:
+        from .. import readme as _readme  # lazy: keep SessionStart import-light
+        from ..canon import store as _store
+
+        if _readme.readme_file(root).is_file():
+            return False
+        return _store.is_empty_skeleton(_store.read(root))
+    except Exception:  # noqa: BLE001 — unreadable canon is not a newborn
+        return False
+
+
+def _readme_drift_warnings(root: Path) -> List[str]:
+    """Warning line when the current project's README has drifted from canon.
+
+    Emits a single line for code 1 (stale / missing / hand-edited / canon moved
+    ahead). Code 0 (current) and code 2 (oracle-error: no CANON.md) are silent —
+    the hook must never raise or break a session on any error. A NEWBORN project
+    (:func:`_is_newborn`) is silent too: there is no README because there is not
+    yet a canon to derive one from.
+    """
+    try:
+        from .. import readme as _readme  # lazy: keep SessionStart import-light
+
+        if _is_newborn(root):
+            return []
+        if _readme.is_manual_control_home_readme(root):
+            # The home's init-written orientation README is manual by design —
+            # not drift.
+            return []
+        code, _reasons = _readme.check(root)
+        if code == 1:
+            return ["  readme: drift — run 'tide readme' to regenerate"]
+    except Exception as exc:
+        # F4: "hook must never raise" means no-raise, NOT silence.
+        # Emit a stderr advisory so the degradation is visible.
+        print(
+            "tide: [session-start] readme-drift check failed: {0}".format(exc),
+            file=sys.stderr,
+        )
+    return []
+
+
+def _arc_first_warnings(root: Path, role: str) -> List[str]:
+    """Warn the HEAD when it leads work with no open arc and no signed contract.
+
+    Advisory only (SessionStart never blocks). A no-op for workers (they always
+    hold exactly one arc) and whenever work is already anchored — an open arc OR a
+    signed/running/output contract. The escape hatch keeps a legitimate read/orient
+    entry on the control-home from nagging once a contract exists.
+    """
+    if role != "orchestrator":
+        return []  # workers always hold one arc — no-op
+    if edit_gate.has_open_arc(root):
+        return []
+    if _has_signed_contract(root):  # signed/running/output ⇒ work is anchored
+        return []
+    return [
+        "  ⚠ arc-first: no open arc / signed contract — anchor work before "
+        "leading it ('tide arc new <slug>')"
+    ]
+
+
+def _onboarding_nudge(root: Path) -> List[str]:
+    """First-run nudge: ONE line pointing at ``tide onboarding`` until it is passed.
+
+    Peripheral add-on (see :mod:`tide.onboarding`): lazy-imported and fully
+    defensive, so it can be deleted in a single edit (this function + its one call
+    site in :func:`render`) without touching any core session-start logic, and a
+    broken add-on never breaks a session. Silent once onboarding is marked passed.
+    """
+    try:
+        from ..onboarding import nudge
+
+        return nudge(root)
+    except Exception:
+        return []
+
+
+def _open_board_notes(root: Path) -> List[str]:
+    """Surface any open focus board (wake board) with its phone URL + focus count.
+
+    Peripheral add-on (mirrors :func:`_onboarding_nudge`): scans arc workspaces for
+    a ``board.json`` and emits one line per open board — its thread, the focus
+    count, and the published Artifact URL when present (so the phone surface is one
+    glance away on entry). Fully defensive + lazy: a broken/edited board never
+    breaks session-start, and this whole add-on deletes in one edit (this function
+    + its call site in :func:`render`).
+    """
+    try:
+        import json as _json
+
+        arcs = paths.arcs_dir(root)
+        if not arcs.is_dir():
+            return []
+        notes: List[str] = []
+        for bf in sorted(arcs.rglob("workspace/board.json")):
+            # skip boards under a sealed (closed) arc — any __name__ path segment
+            if any(seg.startswith("__") and seg.endswith("__") for seg in bf.parts):
+                continue
+            try:
+                data = _json.loads(bf.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            focus = data.get("focus") or {}
+            cards = focus.get("cards") or []
+            limit = focus.get("limit", 7)
+            thread = bf.parent.parent.name  # arc dir holding workspace/
+            line = "  board {0} (focus {1}/{2})".format(thread, len(cards), limit)
+            url = data.get("artifact_url")
+            if url:
+                line += " → " + url
+            notes.append(line)
+        return notes
+    except Exception:
+        return []
+
+
+def _project_notes_index(root: Path) -> List[str]:
+    """INDEX of the project's notes (07-17): the agent KNOWS what it can pick up
+    without loading the bodies. A note = ``.tide/notes/NN-slug.md`` (a shelf
+    reference card: commands, cheat sheets); only the title + tags arrive here,
+    one line per note + one "how to read" line. Peripheral add-on (mirrors
+    :func:`_open_board_notes`): defensive + deletable in one edit."""
+    try:
+        import re as _re
+
+        d = paths.tide_dir(root) / "notes"
+        if not d.is_dir():
+            return []
+        out: List[str] = []
+        for f in sorted(d.glob("*.md")):
+            try:
+                head = f.read_text(encoding="utf-8", errors="ignore")[:600]
+            except OSError:
+                continue
+            first = head.splitlines()[0] if head.splitlines() else ""
+            title = first.lstrip("# ").strip() or f.stem
+            m = _re.search(r"^tags:\s*(.+)$", head, _re.M)
+            tags = " [{0}]".format(m.group(1).strip()) if m else ""
+            out.append("  {0} — {1}{2}".format(f.stem, title, tags))
+        if out:
+            out.append("  (the human's cheat sheets from the board shelf; need one — "
+                       "read .tide/notes/<name>.md, don't load them all; editing one — "
+                       "append a line to its ## log: time — what — who)")
+        return out
+    except Exception:
+        return []
+
+
+def _svetofor_line(root: Path) -> List[str]:
+    """The tier-0 traffic light: ONE line of health numbers at the very top of entry.
+
+    Peripheral add-on (mirrors :func:`_open_board_notes`): the four tier-0 counts
+    (unread / canon-debt / offers / roster-not-ready) as one glyphed line, so the
+    session sees red before it bites. Fully defensive + lazy — a broken corner or a
+    missing control-home yields no line, never a session break — and the whole
+    add-on deletes in one edit (this function + its call site in :func:`render`)."""
+    try:
+        from .. import health
+
+        return [health.render_line(health.compute_health(root))]
+    except Exception:
+        return []
+
+
+def _session_decisions(root: Path, session: Optional[str]) -> List[str]:
+    """The current nit's OPEN decisions, as lines — or [].
+
+    Resolves the running *session* (sid) → its session arc → its nit, then renders
+    that nit's open decisions (the anti-re-litigation set). Best-effort and silent:
+    no sid, no match, or no open decisions → ``[]`` (a hook must never break or add
+    noise). Bounded to this nit + capped in :func:`render_open_for_context` (131).
+    """
+    if not session:
+        return []
+    try:
+        from .. import offload
+        from ..arc import decision
+
+        entry = offload.find_session_by_claude_id(root, session)
+        if entry is None:
+            return []
+        thread_slug = slug.entry_slug(entry.parents[1].name)
+        block = decision.render_open_for_context(root, thread_slug)
+        return block.splitlines() if block else []
+    except Exception:  # noqa: BLE001 — a hook must never break a session
+        return []
+
+
+THREAD_SCREEN_POINTER = "tide · the whole thread: `tide thread`"
+
+
+def _thread_screen_pointer(root: Path, session: Optional[str]) -> List[str]:
+    """One line pointing a fresh session at ``tide thread`` — or [].
+
+    The screen's named consumer (release decision 25 — every record has a named
+    consumer) is the session that just woke up with nothing but a seed. If
+    nobody tells it the screen exists, it does what it has always done: asks the
+    human to retell the thread. Printed only when this session actually sits in a
+    thread; best-effort and silent otherwise, like every other hook add-on.
+    """
+    if not session:
+        return []
+    try:
+        from .. import offload
+
+        entry = offload.find_session_by_claude_id(Path(root), session)
+        if entry is None:
+            return []
+        entry.parents[1]        # raises IndexError when it is not inside a thread
+        return [THREAD_SCREEN_POINTER]
+    except Exception:  # noqa: BLE001 — a hook must never break a session
+        return []
+
+
+# the model sees only the first ~2 KB of a SessionStart hook's
+# output. the WHOLE output now fits SESSION_BUDGET — own thread and
+# own project only; the full board (every thread, candidates, health) is one
+# pointer away, ``tide status``. The HEAD (health line, who-am-I, role) comes first
+# and stays inside HEAD_BUDGET; optional blocks ride in only while they fit.
+HEAD_BUDGET = 1536
+SESSION_BUDGET = 1536
+FULL_VIEW_POINTER = "tide · everything else: `tide status`"
+WHOAMI_CLIP = 80
+
+
+def _clip(text: str, limit: int = WHOAMI_CLIP) -> str:
+    t = " ".join((text or "").split())
+    return t if len(t) <= limit else t[: limit - 1].rstrip() + "…"
+
+
+def _whoami(root: Path, session: Optional[str]) -> List[str]:
+    """Who this session is: its passport title, project/thread/session, the
+    thread's goal and the cursor — clipped to fit the head. Without a matching
+    session — one line naming the project. Never raises."""
+    entry = None
+    try:
+        if session:
+            from .. import offload
+
+            entry = offload.find_session_by_claude_id(Path(root), session)
+    except Exception:  # noqa: BLE001 — a hook must never break a session
+        entry = None
+    if entry is None:
+        return ["tide · project {0} · session not bound to a thread".format(Path(root).name)]
+    lines: List[str] = []
+    try:
+        from .. import placeholders
+        from ..arc import stream as _stream
+
+        passport = entry / "arc.md"
+        thread = entry.parents[1]
+        title = (fields.read_field(passport, "title") or "").strip()
+        project = Path(root).name
+        lines.append("tide · you: {0} ({1}thread {2} · session {3})".format(
+            _clip(title or entry.name, 80),
+            "" if project in title else "project {0} · ".format(project),
+            thread.name, entry.name))
+        goal = (fields.read_field(_stream.passport_path(thread), "goal") or "").strip()
+        if not placeholders.is_blind_goal(goal, slug.entry_slug(thread.name)):
+            lines.append("tide · thread goal: {0}".format(_clip(goal)))
+        cursor = _cursor_lines(passport)
+        if cursor:
+            lines.append("tide · cursor: {0}".format(_clip(cursor[0])))
+    except Exception:  # noqa: BLE001
+        return lines or ["tide · session {0}".format(entry.name)]
+    return lines
+
+
+def _cursor_lines(passport: Path) -> List[str]:
+    """Live lines of the passport's ``## cursor`` section (template ``<…>`` stubs skipped)."""
+    try:
+        text = Path(passport).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+    out: List[str] = []
+    inside = False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            inside = line[3:].strip().lower().startswith("cursor")
+        elif inside and line.strip() and not line.strip().startswith("<"):
+            out.append(line.rstrip())
+    return out
+
+
+def _live_threads_line(root: Path) -> List[str]:
+    """One line naming the project's live threads — for a session not yet bound to
+    one (it has no «own thread» to show). Closed threads are history: `tide status`."""
+    try:
+        from ..arc import board as _board  # lazy: keep SessionStart import-light
+
+        names = [e.name for e in _board._stream_entries(paths.arcs_dir(Path(root)))
+                 if not slug.is_closed_entry(e.name)]
+    except Exception:  # noqa: BLE001 — a hook must never break a session
+        return []
+    if not names:
+        return []
+    return [_clip("tide · live threads ({0}): {1}".format(len(names), ", ".join(names)), 400)]
+
+
+def _section(title: str, lines: List[str]) -> List[str]:
+    return ([""] + ([title] if title else []) + lines) if lines else []
+
+
+def render(root: Path, role: str, update_note: Optional[str] = None,
+           session: Optional[str] = None) -> str:
+    """Render the SessionStart text — own thread and own project only.
+
+    HEAD first (health line, who-am-I, role, `tide thread`
+    pointer); then, while the total stays inside :data:`SESSION_BUDGET` bytes, the
+    optional blocks by priority: this nit's open decisions, warnings, update note,
+    focus boards, note index, onboarding nudge. A block that does not fit is named
+    in one line; the closing line always points at `tide status` for the rest.
+
+    *update_note*, when present, is a non-blocking "tide update available" line
+    SURFACED (never auto-applied). It is a parameter — not computed here — so
+    :func:`render` stays pure/snapshot-testable; the live note is resolved by
+    :func:`cmd_session_start`.
+    """
+    root = Path(root)
+    lines: List[str] = _svetofor_line(root)
+    lines += _whoami(root, session)
+    lines.append(_role_reminder(role))
+    pointer = _thread_screen_pointer(root, session)
+    lines += pointer
+
+    warnings = (
+        _unmerged_warnings(root)
+        + _deferred_warnings(root)
+        + _readme_drift_warnings(root)
+        + _arc_first_warnings(root, role)
+    )
+    optional = [
+        # no own thread → the project's live threads, one line (not the board)
+        ("threads", _section("", [] if pointer else _live_threads_line(root))),
+        # the current nit's OPEN decisions — no re-deciding on resume
+        ("decisions", _section("", _session_decisions(root, session))),
+        ("warnings", _section("WARNINGS", warnings)),
+        ("update", _section("UPDATE", [update_note] if update_note else [])),
+        ("boards", _section("BOARD", _open_board_notes(root))),
+        ("notes", _section("NOTES", _project_notes_index(root))),
+        ("onboarding", _section("", _onboarding_nudge(root))),
+    ]
+
+    def size(ls: List[str]) -> int:
+        return len("\n".join(ls).encode("utf-8"))
+
+    footer = ["", FULL_VIEW_POINTER]
+    dropped: List[str] = []
+    for name, block in optional:
+        if not block:
+            continue
+        reserve = len(" · did not fit: , …".encode("utf-8")) + 40
+        if size(lines + block + footer) + reserve <= SESSION_BUDGET:
+            lines += block
+        else:
+            dropped.append(name)
+    if dropped:
+        footer[-1] += " · did not fit: {0}".format(", ".join(dropped))
+    # Last guard: a head that alone overflows (very long goal/cursor) gives back bytes from the goal and cursor lines, never from the role.
+    over = size(lines + footer) - SESSION_BUDGET
+    for idx, line in enumerate(lines):
+        if over <= 0:
+            break
+        if line.startswith(("tide · thread goal:", "tide · cursor:")):
+            raw = line.encode("utf-8")
+            keep = max(40, len(raw) - over - 3)
+            lines[idx] = raw[:keep].decode("utf-8", errors="ignore").rstrip() + "…"
+            over -= len(raw) - len(lines[idx].encode("utf-8"))
+    return "\n".join(lines + footer)
+
+
+# --- CLI handler -----------------------------------------------------------
+
+def _current_role() -> str:
+    """Active TIDE_ROLE via the CLI helper (lazy import avoids any load cycle)."""
+    from ..cli import current_role
+
+    return current_role()
+
+
+def _open_sessions(root: Path) -> List[Path]:
+    """Open session sub-arcs (nested one level inside a thread), any order."""
+    out: List[Path] = []
+    arcs = paths.arcs_dir(Path(root))
+    if not arcs.is_dir():
+        return out
+    for container in arcs.iterdir():
+        if (
+            not container.is_dir()
+            or container.name == paths.CANDIDATES_DIRNAME
+            or slug.is_closed_entry(container.name)
+        ):
+            continue
+        sub = container / paths.ARCS_DIRNAME
+        if not sub.is_dir():
+            continue
+        for s in sub.iterdir():
+            if s.is_dir() and not slug.is_closed_entry(s.name):
+                out.append(s)
+    return out
+
+
+def _is_unclaimed_head(session_dir: Path) -> bool:
+    """True when a session has no real head yet — a freshly-spawned, unlinked session.
+
+    'Unclaimed' = its ``claude-session`` is blank or a ``<placeholder>`` AND it never
+    pulsed (``offloaded-at`` 0/absent). Such a session is invisible to the board until
+    it offloads — the perfect (and safe) target to bind a live id to.
+
+    A session carrying a prepared seed (``input/handoff-seed.md``) is waiting for
+    its launch — its sid is minted at launch, never grabbed here.
+    """
+    pp = session_dir / "arc.md"
+    cs = (fields.read_field(pp, "claude-session") or "").strip()
+    if cs and not cs.startswith("<"):
+        return False
+    if (session_dir / "input" / "handoff-seed.md").is_file():
+        return False
+    off = (fields.read_field(pp, "offloaded-at") or "0").strip()
+    return off in ("", "0")
+
+
+def _link_claude_session(root: Path, session_id: Optional[str]) -> Optional[Path]:
+    """Bind the running claude *session_id* to its tide session passport AT START.
+
+    A session that plans and WAITS for approval never offloads, so — when it wasn't
+    launched through tide's own binder (e.g. the deck's ▶) — its passport stayed blank
+    and the board showed the nit as 'launching' forever, spawning duplicates on retry.
+    Link the id now instead of only on the first offload.
+
+    Safe and idempotent: if any open session already pins THIS id, do nothing; else bind
+    it to the ONE open session that is a fresh unclaimed head. Zero or several candidates
+    ⇒ skip (never overwrite a real link, never guess between heads) — the first-offload
+    linking stays as the fallback. Returns the passport written, or None.
+    """
+    if not session_id:
+        return None
+    sessions = _open_sessions(root)
+    for s in sessions:
+        if (fields.read_field(s / "arc.md", "claude-session") or "").strip() == session_id:
+            return None  # already linked (tide's binder pinned it at launch)
+    fresh = [s for s in sessions if _is_unclaimed_head(s)]
+    if len(fresh) != 1:
+        return None  # ambiguous or none — leave it to the first offload
+    pp = fresh[0] / "arc.md"
+    fields.set_field(pp, "claude-session", session_id)
+    return pp
+
+
+def _is_side_session(session: str) -> bool:
+    try:
+        from .. import sessions as _sessions
+        return _sessions.is_side_sid(session)
+    except Exception:  # noqa: BLE001 — a hook must never break a session
+        return False
+
+
+def cmd_session_start(args) -> int:
+    """``tide hook session-start`` — print the board + reminder + warnings.
+
+    Resolves the project leniently (``find`` not ``require``): outside a tide
+    project it prints nothing and exits 0, so the hook is a no-op anywhere it does
+    not apply rather than a session-breaking error.
+    """
+    root: Optional[Path] = paths.find_tide_root()
+    if root is None:
+        return 0
+    session = _hook_session()
+    if session and _is_side_session(session):
+        # the SDK host's service chat («Summarize this agent result…») in the same
+        # project dir: never pin, stash or rename by it — it is not the session
+        session = None
+    if session:
+        try:
+            _link_claude_session(root, session)  # board sees the head at once
+        except Exception:  # noqa: BLE001 — a hook must never break a session
+            pass
+    print(render(root, _current_role(), update_note=_update_note(), session=session))
+    return 0
+
+
+def _hook_session() -> Optional[str]:
+    """Best-effort current session id from the SessionStart hook's stdin JSON.
+
+    TTY-guarded so a manual ``tide hook session-start`` never blocks on a read, and
+    fully defensive — any hiccup yields None (no session pinch), never a break."""
+    try:
+        import sys as _sys
+        if _sys.stdin is None or _sys.stdin.isatty():
+            return None
+        import json as _json
+        payload = _json.loads(_sys.stdin.read() or "{}")
+        return payload.get("session_id") or payload.get("session")
+    except Exception:  # noqa: BLE001 — a hook must never raise
+        return None
+
+
+def _update_note() -> Optional[str]:
+    """Best-effort 'tide update available' line for SessionStart (None on any issue).
+
+    Lazy-imports :mod:`tide.update.core` so the hook stays light, and swallows all
+    errors there — a SessionStart hook must never break a session, and surfacing
+    an update is strictly advisory (the update is supervised, never auto-applied).
+    """
+    try:
+        from ..update.core import session_note
+
+        return session_note()
+    except Exception:
+        return None

@@ -1,0 +1,72 @@
+"""`tide doctor` routed through the REAL argparse root.
+
+Confirms the command is wired into ``cli.build_parser`` and that the aggregate
+exit code reaches ``cli.main`` (0 when healthy, nonzero when a check fails). The
+network probe is suppressed with ``--no-network`` so the CLI tests are hermetic
+(no implicit network — the whole point of the candidate). ``$TIDE_HOME`` is
+redirected to a tmp dir so the real machine's install marker never leaks in.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from tide import cli
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_home(tmp_path, monkeypatch):
+    # Redirect the install-marker home so doctor reads a tmp (absent) marker,
+    # never the developer's real ~/.local/share/tide marker.
+    monkeypatch.setenv("TIDE_HOME", str(tmp_path / "harness-home"))
+
+
+def test_doctor_is_wired_into_the_parser():
+    parser = cli.build_parser()
+    args = parser.parse_args(["doctor", "--no-network"])
+    assert getattr(args, "_cmd", None) == "doctor"
+    assert callable(getattr(args, "func", None))
+
+
+def test_doctor_runs_green_in_a_healthy_project(tmp_project, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_project)
+    rc = cli.main(["doctor", "--no-network"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    # the board lists each check by name
+    for name in ("python", "structure", "canon", "hooks", "install-marker", "channel"):
+        assert name in out
+
+
+def test_doctor_exits_nonzero_outside_a_tide_project(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)  # no .tide anywhere above a pytest tmp dir
+    rc = cli.main(["doctor", "--no-network"])
+    capsys.readouterr()
+    assert rc != 0
+
+
+def test_doctor_help_is_listed(capsys):
+    rc = cli.main(["help"])
+    assert rc == 0
+    assert "doctor" in capsys.readouterr().out.lower()
+
+
+def test_doctor_line_prints_one_health_line_with_tristate_exit(tmp_project, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_project)
+    rc = cli.main(["doctor", "--line"])
+    out = capsys.readouterr().out.strip()
+    # exactly one line, carrying the four tier-0 counts
+    assert "\n" not in out
+    for token in ("unread", "rules", "handoffs", "projects"):
+        assert token in out
+    # a clean fixture is green → tristate exit 0
+    assert rc == 0
+
+
+def test_doctor_full_report_carries_the_health_line_at_the_top(tmp_project, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_project)
+    cli.main(["doctor", "--no-network"])
+    lines = capsys.readouterr().out.splitlines()
+    # the traffic light rides above the "tide doctor" header
+    assert "unread" in lines[0]
+    assert lines[1] == "tide doctor"

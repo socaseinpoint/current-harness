@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tide"
+version = "1.0.52"
+description = "tide — simplified, synchronous, human-driven orchestration machine (pure CLI + markdown, no autonomy)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "tide contributors" }]
+keywords = ["orchestration", "cli", "arcs", "cannon", "contracts"]
+
+# Runtime: STDLIB ONLY. No web deps, no click — argparse is the CLI surface.
+dependencies = []
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: Utilities",
+]
+
+[project.urls]
+Source = "https://github.com/current-harness/current-harness"
+Changelog = "https://github.com/current-harness/current-harness/blob/main/QUICKSTART.md"
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+tide = "tide.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# The living board ships its own template and shell-kit side. Without these the
+# page renders to a traceback on a fresh install: live_projection looks for
+# scope/index.html next to itself, and a wheel carries only .py by default.
+[tool.setuptools.package-data]
+"tide.board" = ["scope/*.html", "shell/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# src-layout: make `import tide` work without an editable install (pytest >=7).
+pythonpath = ["src"]

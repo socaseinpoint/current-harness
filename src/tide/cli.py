@@ -1,0 +1,485 @@
+"""tide — single binary, namespaced subcommands.
+
+This is the CLI root. It wires every subcommand group via a uniform
+``register(subparsers)`` / handler pattern (the module owns its parser + a thin
+handler; logic lives in plain argparse-free functions).
+
+SCAFFOLD STATE: the groups below are registered as STUBS. Each later build unit
+replaces its ``_register_*`` body with a call into the real module's
+``register(subparsers)`` (the module owns the parser + thin handler; logic lives
+in plain, argparse-free module functions so it stays unit-testable).
+
+Roles: commands that mutate shared truth (``canon merge``, ``candidate
+promote``) are ORCHESTRATOR-ONLY and hard-refuse unless TIDE_ROLE=orchestrator.
+The role check lives in ``require_orchestrator`` so every gated handler reuses it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from typing import List, Optional
+
+from . import __version__
+from .arc.stream import StreamError
+from tide.human import tr as _h
+
+ROLE_ENV = "TIDE_ROLE"
+ROLE_ORCHESTRATOR = "orchestrator"
+ROLE_WORKER = "worker"
+
+
+class RoleError(SystemExit):
+    """Raised (as a nonzero exit) when a worker attempts an orchestrator-only op."""
+
+
+def current_role() -> str:
+    """Return the active role from $TIDE_ROLE; default 'worker' (least privilege)."""
+    return os.environ.get(ROLE_ENV, ROLE_WORKER).strip().lower() or ROLE_WORKER
+
+
+def require_orchestrator(action: str) -> None:
+    """Hard-refuse an orchestrator-only action unless TIDE_ROLE=orchestrator.
+
+    Used by ``canon merge`` and ``candidate promote``. Raises a nonzero
+    SystemExit with a clear message — workers literally cannot run these.
+    """
+    role = current_role()
+    if role != ROLE_ORCHESTRATOR:
+        raise RoleError(
+            "refused: '{action}' is orchestrator-only "
+            "(TIDE_ROLE={role!r}; set TIDE_ROLE={orch} to run it)".format(
+                action=action, role=role, orch=ROLE_ORCHESTRATOR
+            )
+        )
+
+
+# --- stub plumbing ---------------------------------------------------------
+# Every group registers subparsers whose default handler is _stub. As units land
+# they swap _stub for the module's real handler. The unit tag tells the reader
+# (and the next builder) exactly which unit owns the wiring.
+
+def _stub(unit: str):
+    def _handler(args: argparse.Namespace) -> int:
+        print(
+            "tide: '{cmd}' is not implemented yet (build unit {unit})".format(
+                cmd=getattr(args, "_cmd", "?"), unit=unit
+            ),
+            file=sys.stderr,
+        )
+        return 2
+
+    return _handler
+
+
+def _add_stub(sub, name: str, help_text: str, unit: str) -> argparse.ArgumentParser:
+    p = sub.add_parser(name, help=help_text)
+    p.set_defaults(func=_stub(unit), _cmd=name)
+    return p
+
+
+# --- group registration points --------------------------------------------
+# TODO(U9): replace each _register_* below with `from .<module> import register;
+# register(subparsers)` once the owning unit lands. Keep the handler thin.
+
+def _register_init(sub) -> None:
+    # U9: real control-home unfold (+ dogfood .tide + roster + README + optional git).
+    from .init_home import register as register_init
+
+    register_init(sub)
+
+
+def _register_status(sub) -> None:
+    # U8: real STREAM board (computed N/M + CANDIDATES + drift/unmerged flags).
+    from .arc.board import cmd_status
+
+    p = sub.add_parser("status", help="render the STREAM board for the current project")
+    p.add_argument("--all", action="store_true", help="roster-wide status")
+    p.add_argument("--json", action="store_true", help="emit the board as JSON (canon/drift projection)")
+    p.set_defaults(func=cmd_status, _cmd="status")
+
+
+def _register_board(sub) -> None:
+    # the board in the box — a projection server from the package, localhost, port by flag.
+    from .board_server import register as register_board
+
+    register_board(sub)
+
+
+def _register_strictness(sub) -> None:
+    # U5: real per-project strict|loose dial (show/set in .tide/state/strictness).
+    from .strictness import register as register_strictness
+
+    register_strictness(sub)
+
+
+def _register_plugins(sub) -> None:
+    # the core/plugin boundary — catalogue in code, switch in the home.
+    from .plugins import register as register_plugins
+
+    register_plugins(sub)
+
+
+def _register_install_hooks(sub) -> None:
+    # U10: real install-hooks (SessionStart + PreToolUse, merge-not-clobber).
+    from .hooks.install import register as register_install
+
+    register_install(sub)
+
+
+def _register_install_skills(sub) -> None:
+    # mirror of install-hooks — deliver skills/* as symlinks so the
+    # skill version always equals the installed tool's source.
+    from .skills_install import register as register_skills
+
+    register_skills(sub)
+
+
+def _register_hook(sub) -> None:
+    # U10: internal dispatch group the installed settings.json calls
+    # (`tide hook session-start` / `tide hook edit-gate`).
+    from .hooks.install import register_hook_group
+
+    register_hook_group(sub)
+
+
+def _register_roster(sub) -> None:
+    # U5: real control-home 'name | path' registry (add/rm/ls).
+    from .roster import register as register_roster
+
+    register_roster(sub)
+
+
+def _register_adopt(sub) -> None:
+    # tide adopt [path] — one-command onboarding: git init + .tide/ scaffold +
+    # control-home roster, all idempotent.
+    from .adopt import register as register_adopt
+
+    register_adopt(sub)
+
+
+def _register_layer(sub) -> None:
+    # where the operator layer lives — on this machine (default) or
+    # committed with the project. Owns .git/info/exclude; never .gitignore.
+    from .layer import register as register_layer
+
+    register_layer(sub)
+
+
+def _register_migrate_arcs(sub) -> None:
+    # 15-migrate-arcs: finish the half-done legacy .arcs/ → .tide/ migration per
+    # project (copy arcs+candidates, carry config/lang + CANON, backup .arcs). One
+    # deterministic command replacing the hand-run recipe; --dry-run/--verify/--force.
+    from .migrate import register as register_migrate
+
+    register_migrate(sub)
+
+
+def _register_readme(sub) -> None:
+    # 114-derived-materials: tide readme — generate the user-door README.md as a
+    # projection of CANON.md (generated + stamped + gated), one level up from the
+    # code↔canon machinery. --check is the drift gate (mirrors `canon gate`).
+    from .readme import register as register_readme
+
+    register_readme(sub)
+
+
+def _register_onboarding(sub) -> None:
+    # C2: peripheral first-run onboarding add-on — guided pass-or-skip walkthrough
+    # of the first-project flow. Self-contained in tide.onboarding/; this is the
+    # ONLY core wiring it needs (mirror touch-point: one nudge line in session_start).
+    from .onboarding import register as register_onboarding
+
+    register_onboarding(sub)
+
+
+def _register_self_update(sub) -> None:
+    # 18-self-update: keep one tide current on any machine — detect a stale install
+    # vs the source-of-truth (pluggable VersionSource), run the REGRESSION GATE
+    # (verify --portable + suite), reinstall only on green. The published-channel
+    # source is a later seam (crit E); today the source is the local checkout.
+    from .update.commands import register as register_self_update
+
+    register_self_update(sub)
+
+
+def _register_doctor(sub) -> None:
+    # 23-tide-doctor: on-demand health/diagnostic command (python/structure/canon/
+    # hooks/install-marker/self-update channel). ON-DEMAND ONLY — never a hook, never
+    # a daemon (no-autonomy razor); the channel network probe runs solely here and is
+    # offline-tolerant + skippable (--no-network).
+    from .doctor import register as register_doctor
+
+    register_doctor(sub)
+
+
+def _register_verify(sub) -> None:
+    # F7: isolated verification affordance — stage a built artifact into a temp dir,
+    # serve it on an OS-assigned ephemeral port, and check it (HTTP 200 + optional
+    # node inline-script syntax smoke). stdlib-only; no fixed-port collisions.
+    from .verify import register as register_verify
+
+    register_verify(sub)
+
+
+def _register_quickstart(sub) -> None:
+    # the route out of "where is the instruction?" — ships in the
+    # package, so it answers with no clone and no network.
+    from .quickstart import register as register_quickstart
+
+    register_quickstart(sub)
+
+
+def _register_arc(sub) -> None:
+    # U3: real arc-stream verbs (new/new-goal/open/resume/close/reopen/supersede).
+    # 11-arc-worktree-isolation: worktree.register adds `work`; arc-land-strictness-
+    # dial: land.register_land adds the atomic, strictness-gated `land`.
+    # TODO(U4): tide.arc.candidate is a separate top-level group; status is U8.
+    from .arc.board import cmd_status as arc_status
+    from .arc.gc import register as register_gc
+    from .arc.land import register_land
+    from .arc.stream import register as register_stream
+    from .arc.worktree import register as register_worktree
+
+    p = sub.add_parser("arc", help="work stream: new/open/close/reopen/supersede/work/land/gc")
+    asub = p.add_subparsers(dest="arc_cmd")
+    register_stream(asub)
+    register_worktree(asub)
+    register_land(asub)
+    register_gc(asub)
+    sp = asub.add_parser("status", help="render the STREAM board")
+    sp.add_argument("--json", action="store_true", help="emit the board as JSON (canon/drift projection)")
+    sp.set_defaults(func=arc_status, _cmd="arc status")
+
+
+def _register_reconcile(sub) -> None:
+    # arc-land-strictness-dial: pay down the deferred-reconciliation debt ledger
+    # (strict-land each owed arc). Lives top-level — it spans the whole stream.
+    from .arc.land import register_reconcile
+
+    register_reconcile(sub)
+
+
+def _register_candidate(sub) -> None:
+    # U4: real candidate group (add/list/promote; promote=orchestrator-only).
+    from .arc.candidate import register as register_candidate
+
+    register_candidate(sub)
+
+
+def _register_work(sub) -> None:
+    # board "works" — deterministic agent gestures
+    # over .tide/arcs/works/*/work.md (open→taken→review→done + log);
+    # done is set only with the human's word (--word), the board is just a projection.
+    from .arc.work import register as register_work
+
+    register_work(sub)
+
+
+def _register_artifact(sub) -> None:
+    # "artifact" — a thing the agent puts on the human's
+    # desk (a message, a command, a file) over
+    # .tide/arcs/artifacts/*/artifact.md (new→taken + log); the human collects it
+    # with their word (--word), the board just shows the desk.
+    from .arc.artifact import register as register_artifact
+
+    register_artifact(sub)
+
+
+def _register_decision(sub) -> None:
+    # the "decision" entity — a thread's
+    # conclusion-atoms (decision:canon :: commit:repo). add/list live over
+    # <thread>/decisions.md; settle raises a decision into the canon journal.
+    from .arc.decision import register as register_decision
+
+    register_decision(sub)
+
+
+def _register_thread(sub) -> None:
+    # "show the thread" — one screen a thread is
+    # understood from (goal · plan step · decisions by state · what moves · what
+    # waits for the human), plus the ONE hygiene check behind release decision 28.
+    # A projection over plan.md / decisions.md / works / passports — no store.
+    from .arc.thread_screen import register as register_thread
+
+    register_thread(sub)
+    _register_thread_layers(sub)
+
+
+def _register_thread_layers(sub) -> None:
+    # `tide thread layers <thread> [--seed-skeleton]` —
+    # which of the thread's three layers are empty; --seed-skeleton adds their empty
+    # scaffold to an old thread's goal file, leaving the rest alone.
+    p = sub.choices.get("thread")
+    if p is None:
+        return
+    p.add_argument("--seed-skeleton", action="store_true", dest="seed_skeleton",
+                   help="with `layers`: add the empty three-layer scaffold to the goal file")
+    # `tide thread layer <thread> --expect … --where … --exp …` — layers are written by command.
+    p.add_argument("--expect", dest="layer_expect", default=None,
+                   help=_h("with `layer`: line for 'user expectation' (their words)"))
+    p.add_argument("--where", dest="layer_where", default=None,
+                   help=_h("with `layer`: line for 'where we are' (done · going · waits for the human)"))
+    p.add_argument("--exp", dest="layer_exp", default=None,
+                   help="with `layer`: line for 'experience' (pitfalls, loops, rejected)")
+    # the thread plan.md's 'main' section — also by command.
+    p.add_argument("--main", dest="layer_main", action="append", default=None,
+                   help="with `layer`: line(s) for 'main' in the thread's plan.md "
+                        "(task · who to deliver to · whom not to duplicate; repeatable, "
+                        "split on ' · '); appends unless --replace")
+    p.add_argument("--replace", dest="layer_replace", action="store_true",
+                   help="with `layer --main`: replace the 'main' section wholesale")
+    # `tide thread goal-tidy <thread|goal-file> [--dry-run]` — the goal file's layer
+    # log goes to <thread>-goal-log.md beside it, the header placeholder becomes goal:;
+    # `--all --dry-run` — a report across all threads in the roster.
+    p.add_argument("--dry-run", dest="goal_dry", action="store_true",
+                   help="with `goal-tidy`: report only, write nothing")
+    prev = p.get_default("func")
+
+    def _dispatch(args) -> int:
+        ref = getattr(args, "ref", None)
+        if ref not in ("layers", "layer", "goal-tidy"):
+            return prev(args)
+        from .arc import thread_layers
+
+        if ref == "layer":
+            return thread_layers.cmd_layer(args)
+        if ref == "goal-tidy":
+            return thread_layers.cmd_goal_tidy(args)
+        return thread_layers.cmd_layers(args)
+
+    p.set_defaults(func=_dispatch)
+
+
+def _register_plan(sub) -> None:
+    # 19-tide-plan-board: the focus board (wake board) bound to a goal-arc —
+    # board.json in the arc workspace with ≤7 focus + ≤3 path + a distill axis.
+    # Provisional name `tide plan` (final name is the human's).
+    from .arc.plan import register as register_plan
+
+    register_plan(sub)
+
+
+def _register_offload(sub) -> None:
+    # offload as you go — one fast command (a line in ## context +
+    # --cursor + the offloaded-at stamp).
+    from .offload import register as register_offload
+
+    register_offload(sub)
+
+
+def _register_canon(sub) -> None:
+    # U2: real canon group (init/rev/merge live; status stubbed for U8).
+    # ``cannon`` is a hidden CLI alias registered inside commands.register().
+    from .canon.commands import register as register_canon
+
+    register_canon(sub)
+
+
+def _register_contract(sub) -> None:
+    # U6: real contract group (lifecycle new/sign/report/proof/accept/close/
+    # reopen/state/list + ask/answer; close=orchestrator-only via the handler).
+    from .contract.lifecycle import register as register_contract
+
+    register_contract(sub)
+
+
+def _cmd_version(args: argparse.Namespace) -> int:
+    """``tide version`` — the command form of ``--version`` (same string)."""
+    print("tide {0}".format(__version__))
+    return 0
+
+
+def _cmd_help(args: argparse.Namespace) -> int:
+    """``tide help`` — print the root help (the command form of ``-h``)."""
+    build_parser().print_help()
+    return 0
+
+
+def _register_version(sub) -> None:
+    p = sub.add_parser("version", help="print the tide version")
+    p.set_defaults(func=_cmd_version, _cmd="version")
+
+
+def _register_help(sub) -> None:
+    p = sub.add_parser("help", help="show this help (every command group)")
+    p.set_defaults(func=_cmd_help, _cmd="help")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the argparse root with every (currently stubbed) group wired."""
+    parser = argparse.ArgumentParser(
+        prog="tide",
+        description="tide — simplified, synchronous orchestration machine (no autonomy).",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="tide {0}".format(__version__),
+    )
+    subparsers = parser.add_subparsers(dest="command", metavar="<command>")
+
+    # Human surface
+    _register_init(subparsers)
+    _register_status(subparsers)
+    _register_board(subparsers)
+    _register_strictness(subparsers)
+    _register_plugins(subparsers)
+    _register_install_hooks(subparsers)
+    _register_install_skills(subparsers)
+    _register_roster(subparsers)
+    _register_adopt(subparsers)
+    _register_layer(subparsers)
+    _register_migrate_arcs(subparsers)
+    _register_readme(subparsers)
+    _register_doctor(subparsers)
+    _register_verify(subparsers)
+    _register_quickstart(subparsers)
+    _register_onboarding(subparsers)
+    _register_self_update(subparsers)
+    _register_version(subparsers)
+    _register_help(subparsers)
+
+    # Agent module surface
+    _register_arc(subparsers)
+    _register_reconcile(subparsers)
+    _register_candidate(subparsers)
+    _register_work(subparsers)
+    _register_artifact(subparsers)
+    _register_decision(subparsers)
+    _register_thread(subparsers)
+    _register_plan(subparsers)
+    _register_offload(subparsers)
+    _register_canon(subparsers)
+    _register_contract(subparsers)
+
+    # Internal hook-dispatch group (the commands install-hooks writes into settings.json)
+    _register_hook(subparsers)
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """Entry point for the ``tide`` console_script."""
+    raw = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+    args = parser.parse_args(raw)
+
+    func = getattr(args, "func", None)
+    if func is None:
+        parser.print_help()
+        return 0
+
+    try:
+        return int(func(args) or 0)
+    except RoleError as exc:
+        print("tide: {0}".format(exc), file=sys.stderr)
+        return 1
+    except (StreamError, FileNotFoundError) as exc:
+        print("tide: {0}".format(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
