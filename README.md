@@ -1,4 +1,12 @@
-# tide
+# Current Harness
+
+Current Harness turns your Claude Code agents into a team. They remember yesterday, finish what they start and come to you only with what matters.
+
+https://currentharness.com
+
+![Current Harness demo](docs/demo.gif)
+
+## The tide CLI
 
 **One seat for many projects. CLI + markdown + a board on localhost.**
 
