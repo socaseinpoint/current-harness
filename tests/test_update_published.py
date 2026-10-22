@@ -75,7 +75,7 @@ def _published(
         marker_path=tmp_path / "install-marker.json",
         cache_path=tmp_path / "cache.json",
         rollback_path=tmp_path / "rollback.json",
-        repo="current-harness/current-harness",
+        repo="socaseinpoint/current-harness",
         homebrew=homebrew,
         opener=opener if opener is not None else _opener(_feed("v1.0.1")),
     )
@@ -262,12 +262,12 @@ def test_install_command_pip_from_git_when_not_brew(tmp_path: Path):
     s = _published(tmp_path, homebrew=False)
     cmd = s.install_command()
     assert cmd[:5] == ["/py", "-m", "pip", "install", "--upgrade"]
-    assert cmd[-1] == "git+https://github.com/current-harness/current-harness@v1.0.1"
+    assert cmd[-1] == "git+https://github.com/socaseinpoint/current-harness@v1.0.1"
 
 
 def test_install_command_brew_when_homebrew(tmp_path: Path):
     s = _published(tmp_path, homebrew=True)
-    assert s.install_command() == ["brew", "upgrade", "current-harness/current-harness/tide"]
+    assert s.install_command() == ["brew", "upgrade", "socaseinpoint/current-harness/tide"]
 
 
 def test_detect_homebrew_from_cellar_path():
@@ -285,7 +285,7 @@ def test_rollback_command_pins_installed_version(tmp_path: Path):
     # the IMMUTABLE release-asset sdist — the same artifact the brew formula
     # pins, so a rollback lands exactly the bytes that were published.
     assert cmd[-1] == (
-        "https://github.com/current-harness/current-harness/releases/download/v0.1.0/tide-0.1.0.tar.gz"
+        "https://github.com/socaseinpoint/current-harness/releases/download/v0.1.0/tide-0.1.0.tar.gz"
     )
     assert "--force-reinstall" in cmd  # a rollback is a DOWNGRADE; --upgrade refuses
 
@@ -319,10 +319,10 @@ def _make_release_tarball(build_root: Path, version: str = "1.0.1") -> bytes:
 def test_tarball_url():
     s = PublishedChannelSource(
         python_exe="/py", marker_path=Path("/m"), cache_path=Path("/c"),
-        rollback_path=Path("/r"), repo="current-harness/current-harness",
+        rollback_path=Path("/r"), repo="socaseinpoint/current-harness",
     )
     assert s.tarball_url("v1.0.1") == (
-        "https://github.com/current-harness/current-harness/archive/refs/tags/v1.0.1.tar.gz"
+        "https://github.com/socaseinpoint/current-harness/archive/refs/tags/v1.0.1.tar.gz"
     )
 
 
@@ -475,7 +475,7 @@ def test_published_update_green_gate_installs_stamps_and_records_rollback(tmp_pa
     rollback = src.read_rollback(s.rollback_path)
     assert rollback["version"] == "0.1.0"
     assert rollback["command"][-1] == (
-        "https://github.com/current-harness/current-harness/releases/download/v0.1.0/tide-0.1.0.tar.gz"
+        "https://github.com/socaseinpoint/current-harness/releases/download/v0.1.0/tide-0.1.0.tar.gz"
     )
 
 
@@ -601,7 +601,7 @@ def test_rollback_replays_pinned_command_and_smokes(tmp_path: Path):
     marker = tmp_path / "rollback.json"
     src.write_rollback(
         marker, "0.1.0",
-        ["/py", "-m", "pip", "install", "--upgrade", "git+https://github.com/current-harness/current-harness@v0.1.0"],
+        ["/py", "-m", "pip", "install", "--upgrade", "git+https://github.com/socaseinpoint/current-harness@v0.1.0"],
     )
     runner = FakeRunner(install=(0, ""), smoke=(0, "tide 0.1.0"))
     res = core.rollback(marker, runner=runner)
@@ -616,7 +616,7 @@ def test_rollback_clears_broken_install_marker(tmp_path: Path):
     marker = tmp_path / "rollback.json"
     src.write_rollback(
         marker, "0.1.0",
-        ["/py", "-m", "pip", "install", "--upgrade", "git+https://github.com/current-harness/current-harness@v0.1.0"],
+        ["/py", "-m", "pip", "install", "--upgrade", "git+https://github.com/socaseinpoint/current-harness@v0.1.0"],
     )
     broken = tmp_path / "broken-install-marker.json"
     src.write_broken(broken, "1.0.1", "post-install smoke check failed")

@@ -40,7 +40,7 @@ it walks the `tide` verbs. Full list: `tide help`.
 Needs **Python ≥ 3.12**. The main door is a clone and one command:
 
 ```bash
-git clone https://github.com/current-harness/current-harness && cd current-harness
+git clone https://github.com/socaseinpoint/current-harness && cd current-harness
 ./install.sh
 ```
 

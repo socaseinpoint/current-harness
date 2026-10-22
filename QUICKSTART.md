@@ -16,7 +16,7 @@ agent in a session walks them — you speak in words.
 ## 1. Install
 
 ```bash
-git clone https://github.com/current-harness/current-harness && cd current-harness
+git clone https://github.com/socaseinpoint/current-harness && cd current-harness
 ./install.sh
 ```
 

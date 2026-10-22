@@ -29,8 +29,8 @@ classifiers = [
 ]
 
 [project.urls]
-Source = "https://github.com/current-harness/current-harness"
-Changelog = "https://github.com/current-harness/current-harness/blob/main/QUICKSTART.md"
+Source = "https://github.com/socaseinpoint/current-harness"
+Changelog = "https://github.com/socaseinpoint/current-harness/blob/main/QUICKSTART.md"
 
 [project.optional-dependencies]
 test = ["pytest>=7.0"]

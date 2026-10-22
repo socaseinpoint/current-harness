@@ -64,7 +64,7 @@ def _published(tmp_path: Path, *, opener) -> PublishedChannelSource:
         marker_path=tmp_path / "install-marker.json",
         cache_path=tmp_path / "cache.json",
         rollback_path=tmp_path / "rollback.json",
-        repo="current-harness/current-harness",
+        repo="socaseinpoint/current-harness",
         opener=opener,
     )
 

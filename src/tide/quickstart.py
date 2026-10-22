@@ -25,14 +25,14 @@ import webbrowser
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-PAGE_URL = "https://github.com/current-harness/current-harness/blob/main/QUICKSTART.md"
+PAGE_URL = "https://github.com/socaseinpoint/current-harness/blob/main/QUICKSTART.md"
 GUIDE_FILE = "QUICKSTART.md"
 
 # The route. One line per step, each with the gesture that walks it — this is what
 # a person stuck in a terminal actually needs. Kept short on purpose: it must fit
 # on one screen next to whatever they were already looking at.
 STEPS: List[Tuple[str, str]] = [
-    ("install", "git clone https://github.com/current-harness/current-harness && cd current-harness && ./install.sh"),
+    ("install", "git clone https://github.com/socaseinpoint/current-harness && cd current-harness && ./install.sh"),
     ("a home — the one folder you lead from",
      "mkdir ~/harness-home && cd ~/harness-home && tide init --git"),
     ("tell the shell where it is (put this in your profile)",

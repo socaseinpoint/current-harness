@@ -520,7 +520,7 @@ class LocalSourceCheckout:
 # The release repo is DISCOVERED from the package's own declared source URL (the
 # pyproject ``[project.urls]`` -> dist ``Project-URL`` metadata). This is the one
 # place the update address lives: the fallback used when no metadata resolves.
-UPDATE_REPO = "current-harness/current-harness"
+UPDATE_REPO = "socaseinpoint/current-harness"
 _FALLBACK_REPO = UPDATE_REPO
 _GITHUB_REPO_RE = re.compile(r"github\.com[/:]([^/\s,]+)/([^/\s,#]+)")
 CACHE_TTL_S = 24 * 60 * 60  # 24h: session start does NOT hit the network every time
