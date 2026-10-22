@@ -6,7 +6,7 @@ https://currentharness.com
 
 ![Current Harness demo](docs/demo.gif)
 
-# tide
+## The tide CLI
 
 **One seat for many projects. CLI + markdown + a board on localhost.**
 
